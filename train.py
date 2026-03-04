@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class SimpleFaceCNN(nn.Module):
@@ -10,35 +9,35 @@ class SimpleFaceCNN(nn.Module):
     Výstup: Vektor príznakov / embeddings (zhluky), resp. klasifikačné skóre.
     """
 
-    def __init__(self, num_classes=100, embedding_dim=128):
-        super(SimpleFaceCNN, self).__init__()
+    def __init__(self, num_classes: int = 100, embedding_dim: int = 128) -> None:
+        super().__init__()
 
         # Konvolučné vrstvy
-        self.conv1 = nn.Conv2d(
+        self.conv1: nn.Conv2d = nn.Conv2d(
             in_channels=3, out_channels=32, kernel_size=3, stride=1, padding=1
         )
-        self.conv2 = nn.Conv2d(
+        self.conv2: nn.Conv2d = nn.Conv2d(
             in_channels=32, out_channels=64, kernel_size=3, stride=1, padding=1
         )
-        self.conv3 = nn.Conv2d(
+        self.conv3: nn.Conv2d = nn.Conv2d(
             in_channels=64, out_channels=128, kernel_size=3, stride=1, padding=1
         )
 
         # Pooling a aktivácia
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
-        self.relu = nn.ReLU()
+        self.pool: nn.MaxPool2d = nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        self.relu: nn.ReLU = nn.ReLU()
 
         # Ak je na vstupe tensor (batch, 3, 112, 112):
         # pool 1 (112 -> 56)
         # pool 2 (56 -> 28)
         # pool 3 (28 -> 14)
         # Spojené dimenzie (128 kanálov, 14 x 14 grid) -> 128*14*14
-        self.fc_features = nn.Linear(128 * 14 * 14, embedding_dim)
+        self.fc_features: nn.Linear = nn.Linear(128 * 14 * 14, embedding_dim)
 
         # Finálna vrstva pre priamu klasifikáciu osôb počas trénovania
-        self.fc_classifier = nn.Linear(embedding_dim, num_classes)
+        self.fc_classifier: nn.Linear = nn.Linear(embedding_dim, num_classes)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # Extrakcia príznakov
         x = self.pool(self.relu(self.conv1(x)))
         x = self.pool(self.relu(self.conv2(x)))
@@ -48,11 +47,11 @@ class SimpleFaceCNN(nn.Module):
         x = x.view(-1, 128 * 14 * 14)
 
         # Embedding vo vrstve fc_features reprezentuje abstraktné informácie o tvári
-        embeddings = self.fc_features(x)
-        features_activated = self.relu(embeddings)
+        embeddings: torch.Tensor = self.fc_features(x)
+        features_activated: torch.Tensor = self.relu(embeddings)
 
         # Skóre pre zhodnotenie tváre s danými triedami (z osobnostnej databázy napr. 100 osôb)
-        logits = self.fc_classifier(features_activated)
+        logits: torch.Tensor = self.fc_classifier(features_activated)
 
         # Ak chceme získať len črty na porovnanie dvoch identít (napr. Cosine Similarity), používame 'embeddings'
         return embeddings, logits
@@ -67,5 +66,7 @@ if __name__ == "__main__":
     embeddings, logits = model(dummy_input)
 
     print("Vytvorený model: SimpleFaceCNN")
-    print(f"Výstupný rozmer pre embedding: {embeddings.shape} (Očakávané: [1, 128])")
-    print(f"Výstupný rozmer pre triedy: {logits.shape} (Očakávané: [1, 50])")
+    print(
+        f"Výstupný rozmer pre embedding: {tuple(embeddings.shape)} (Očakávané: [1, 128])"
+    )
+    print(f"Výstupný rozmer pre triedy: {tuple(logits.shape)} (Očakávané: [1, 50])")
