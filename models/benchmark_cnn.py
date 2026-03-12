@@ -16,9 +16,9 @@ class ConvBlock(nn.Module):
         self.conv1 = nn.Conv2d(
             in_channels, out_channels, kernel_size=3, padding=1, bias=False
         )
-        # Batch normalizácia – normalizuje výstupy pre stabilnejší a rýchlejší tréning
+        # Batch normalizácia - normalizuje výstupy pre stabilnejší a rýchlejší tréning
         self.bn1 = nn.BatchNorm2d(out_channels)
-        # PReLU – aktivačná funkcia s učiteľným sklonom pre záporné hodnoty
+        # PReLU - aktivačná funkcia s učiteľným sklonom pre záporné hodnoty
         self.act1 = nn.PReLU(out_channels)
 
         # --- Druhý konvolučný prechod ---
@@ -28,7 +28,7 @@ class ConvBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(out_channels)
         self.act2 = nn.PReLU(out_channels)
 
-        # MaxPool 2x2 – vyberie maximálnu hodnotu z každého 2x2 okna, zmenší rozmer na polovicu
+        # MaxPool 2x2 - vyberie maximálnu hodnotu z každého 2x2 okna, zmenší rozmer na polovicu
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
     def forward(self, x):
@@ -62,7 +62,7 @@ class BenchmarkCNN(nn.Module):
         self.flatten = nn.Flatten()
         # Lineárna vrstva premietne 25 088-rozmerný vektor na embedding požadovanej veľkosti
         self.fc = nn.Linear(512 * 7 * 7, embedding_size)
-        # Batch normalizácia nad embeddingom – stabilizuje rozloženie embeddingov
+        # Batch normalizácia nad embeddingom - stabilizuje rozloženie embeddingov
         self.bn = nn.BatchNorm1d(embedding_size)
 
         # --- Klasifikačná hlava ---

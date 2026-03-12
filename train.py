@@ -34,7 +34,7 @@ def main():
         ]
     )
 
-    # ImageFolder automaticky priradí triedu podľa podpriečinka (000000, 000001, …)
+    # ImageFolder automaticky priradí triedu podľa podpriečinka
     train_dataset = datasets.ImageFolder(DATA_DIR, transform=train_transforms)
 
     train_loader = DataLoader(
@@ -62,7 +62,7 @@ def main():
     optimizer = optim.SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    # Mixed precision – zrýchli tréning na GPU použitím float16 kde je to bezpečné
+    # Mixed precision - zrýchli tréning na GPU použitím float16 kde je to bezpečné
     scaler = torch.cuda.amp.GradScaler()
 
     # Načítanie checkpointu ak existuje (resume tréning)
