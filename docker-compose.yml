@@ -1,0 +1,20 @@
+services:
+  benchmark:
+    build: .
+    image: cnn-benchmark-gpu
+    # Pripojíme aktuálny adresár, aby sme mali prístup ku kódu a ukladali modely/logy aj von na disk
+    volumes:
+      - .:/app
+    # Keď ho spustíš bez príkazu, kontajner zostane bežať (ako dev prostredie)
+    command: tail -f /dev/null
+    # Týmto povieme Dockeru, že si prosíme využívať tvoju dedikovanú grafickú kartu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Udržuje tty interaktívnym
+    tty: true
+    stdin_open: true

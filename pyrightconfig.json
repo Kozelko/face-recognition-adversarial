@@ -1,6 +1,6 @@
 {
     "pythonVersion": "3.11",
-    "pythonPlatform": "Windows",
-    "venvPath": "C:/Users/Kozel/miniconda3/envs",
+    "pythonPlatform": "Linux",
+    "venvPath": "/home/kozel/miniconda/envs",
     "venv": "cnn-benchmark"
 }

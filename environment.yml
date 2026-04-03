@@ -16,3 +16,7 @@ dependencies:
     - matplotlib
     - scikit-learn
     - pip
+    - pip:
+      - facenet-pytorch
+      - insightface
+      - onnxruntime
