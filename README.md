@@ -20,8 +20,11 @@ conda activate cnn-benchmark
 ### 2. Inštalácia ďalších závislostí (pip)
 
 ```bash
-pip install facenet-pytorch tqdm
+pip install --no-deps facenet-pytorch tqdm
 ```
+
+`--no-deps` zabráni tomu, aby `pip` prepísal conda-inštalovaný PyTorch stack.
+
 ## Spustenie
 
 ### Predspracovanie datasetu (MTCNN crop)
@@ -36,10 +39,10 @@ Skript používa multiprocessing — automaticky využije dostupné CPU jadrá.
 
 Voliteľné parametre:
 
-| Parameter    | Popis                                  | Default                |
-|-------------|----------------------------------------|------------------------|
-| `--device`  | Zariadenie pre MTCNN (`cpu` / `cuda`)  | `cpu`                  |
-| `--workers` | Počet paralelných workerov             | počet jadier − 2       |
+| Parameter   | Popis                                 | Default          |
+| ----------- | ------------------------------------- | ---------------- |
+| `--device`  | Zariadenie pre MTCNN (`cpu` / `cuda`) | `cpu`            |
+| `--workers` | Počet paralelných workerov            | počet jadier − 2 |
 
 Príklady:
 

@@ -5,6 +5,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim.sgd import SGD
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
@@ -59,7 +60,7 @@ def main():
     model = BenchmarkCNN(num_classes=num_classes).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=5e-4)
+    optimizer = SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     # Mixed precision - zrýchli tréning na GPU použitím float16 kde je to bezpečné
