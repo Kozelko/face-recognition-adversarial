@@ -58,10 +58,13 @@ class BenchmarkCNN(nn.Module):
         )
 
         # --- Embedding hlava ---
-        # Flatten roztiahne 512×7×7 feature mapu do vektora s 25 088 hodnotami
+        # Globálne priemerné pooling zredukuje priestorový rozmer 7x7 na 1x1
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.flatten = nn.Flatten()
-        # Lineárna vrstva premietne 25 088-rozmerný vektor na embedding požadovanej veľkosti
-        self.fc = nn.Linear(512 * 7 * 7, embedding_size)
+        # Dropout ako regularizácia proti overfittingu
+        self.dropout = nn.Dropout(p=0.5)
+        # Lineárna vrstva premietne 512-rozmerný vektor na embedding požadovanej veľkosti
+        self.fc = nn.Linear(512, embedding_size)
         # Batch normalizácia nad embeddingom - stabilizuje rozloženie embeddingov
         self.bn = nn.BatchNorm1d(embedding_size)
 
@@ -70,10 +73,12 @@ class BenchmarkCNN(nn.Module):
         self.classifier = nn.Linear(embedding_size, num_classes)
 
     def forward(self, x, return_embedding=False):
-        x = self.features(x)  # Feature extractor: 112×112×3 → 7×7×512
-        x = self.flatten(x)  # 7×7×512 → 25088
-        x = self.fc(x)  # 25088 → embedding_size
-        x = self.bn(x)  # Batch normalizácia embeddingu
+        x = self.features(x)  # Feature extractor: 112x112x3 -> 7x7x512
+        x = self.avgpool(x)   # 7x7x512 -> 1x1x512
+        x = self.flatten(x)   # 1x1x512 -> 512
+        x = self.dropout(x)   # Regularizácia
+        x = self.fc(x)        # 512 -> embedding_size
+        x = self.bn(x)        # Batch normalizácia embeddingu
 
         if return_embedding:
             return x
