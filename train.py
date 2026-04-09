@@ -34,9 +34,29 @@ def main():
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ]
     )
+    
+    val_transforms = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ]
+    )
 
-    # ImageFolder automaticky priradí triedu podľa podpriečinka
-    train_dataset = datasets.ImageFolder(DATA_DIR, transform=train_transforms)
+    full_train_dataset = datasets.ImageFolder(DATA_DIR, transform=train_transforms)
+    full_val_dataset = datasets.ImageFolder(DATA_DIR, transform=val_transforms)
+
+    # 80% train, 20% validation split
+    total_size = len(full_train_dataset)
+    train_size = int(0.8 * total_size)
+    val_size = total_size - train_size
+
+    generator = torch.Generator().manual_seed(42)
+    train_indices, val_indices = torch.utils.data.random_split(
+        range(total_size), [train_size, val_size], generator=generator
+    )
+
+    train_dataset = torch.utils.data.Subset(full_train_dataset, train_indices.indices)
+    val_dataset = torch.utils.data.Subset(full_val_dataset, val_indices.indices)
 
     train_loader = DataLoader(
         train_dataset,
@@ -46,11 +66,21 @@ def main():
         pin_memory=True,
         persistent_workers=True,
     )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True,
+    )
 
-    num_classes = len(train_dataset.classes)
+    num_classes = len(full_train_dataset.classes)
 
     print(f"Počet tried: {num_classes}")
-    print(f"Počet obrázkov: {len(train_dataset)}")
+    print(f"Počet trénovacích obrázkov: {len(train_dataset)}")
+    print(f"Počet validačných obrázkov: {len(val_dataset)}")
 
     # ──────────────────────────────────────────────
     # Model, stratová funkcia, optimalizátor
@@ -68,6 +98,7 @@ def main():
 
     # Načítanie checkpointu ak existuje (resume tréning)
     start_epoch = 1
+    best_val_acc = 0.0
     if os.path.exists(CHECKPOINT_PATH):
         checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -75,7 +106,8 @@ def main():
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         scaler.load_state_dict(checkpoint["scaler_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
-        print(f"Pokračujem od epochy {start_epoch}")
+        best_val_acc = checkpoint.get("best_val_acc", 0.0)
+        print(f"Pokračujem od epochy {start_epoch}, najlepšia val_acc: {best_val_acc:.2f}%")
 
     # Príprava log súboru
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
@@ -83,18 +115,20 @@ def main():
     log_file = open(LOG_PATH, "a", newline="")
     log_writer = csv.writer(log_file)
     if not log_exists:
-        log_writer.writerow(["epoch", "loss", "accuracy", "time_s"])
+        log_writer.writerow(["epoch", "train_loss", "train_acc", "val_loss", "val_acc", "time_s"])
 
     # ──────────────────────────────────────────────
-    # Trénovacia slučka
+    # Trénovacia a validačná slučka
     # ──────────────────────────────────────────────
     for epoch in range(start_epoch, EPOCHS + 1):
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        num_batches = len(train_loader)
         epoch_start = time.time()
+
+        # --- Trénovanie ---
+        model.train()
+        train_loss = 0.0
+        train_correct = 0
+        train_total = 0
+        num_batches = len(train_loader)
 
         for batch_idx, (images, labels) in enumerate(train_loader, 1):
             images, labels = images.to(device), labels.to(device)
@@ -107,54 +141,86 @@ def main():
             scaler.step(optimizer)
             scaler.update()
 
-            running_loss += loss.item() * images.size(0)
+            train_loss += loss.item() * images.size(0)
             _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            train_total += labels.size(0)
+            train_correct += predicted.eq(labels).sum().item()
 
             if batch_idx % 100 == 0:
                 elapsed = time.time() - epoch_start
-                batch_acc = 100.0 * correct / total
+                batch_acc = 100.0 * train_correct / train_total
                 print(
                     f"  Batch {batch_idx}/{num_batches}  "
-                    f"Loss: {loss.item():.4f}  Acc: {batch_acc:.2f}%  "
+                    f"Train Loss: {loss.item():.4f}  Train Acc: {batch_acc:.2f}%  "
                     f"[{elapsed:.0f}s]"
                 )
 
-        epoch_loss = running_loss / total
-        epoch_acc = 100.0 * correct / total
+        epoch_train_loss = train_loss / train_total
+        epoch_train_acc = 100.0 * train_correct / train_total
+
+        # --- Validácia ---
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for images, labels in val_loader:
+                images, labels = images.to(device), labels.to(device)
+                with torch.cuda.amp.autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                
+                val_loss += loss.item() * images.size(0)
+                _, predicted = outputs.max(1)
+                val_total += labels.size(0)
+                val_correct += predicted.eq(labels).sum().item()
+
+        epoch_val_loss = val_loss / val_total
+        epoch_val_acc = 100.0 * val_correct / val_total
         epoch_time = time.time() - epoch_start
+
         print(
-            f"Epoch {epoch}/{EPOCHS}  Loss: {epoch_loss:.4f}  "
-            f"Acc: {epoch_acc:.2f}%  Čas: {epoch_time:.0f}s"
+            f"Epoch {epoch}/{EPOCHS} | "
+            f"Train Loss: {epoch_train_loss:.4f} Acc: {epoch_train_acc:.2f}% | "
+            f"Val Loss: {epoch_val_loss:.4f} Acc: {epoch_val_acc:.2f}% | "
+            f"Čas: {epoch_time:.0f}s"
         )
 
         scheduler.step()
 
         # Zapis metrík do CSV
         log_writer.writerow(
-            [epoch, f"{epoch_loss:.4f}", f"{epoch_acc:.2f}", f"{epoch_time:.0f}"]
+            [epoch, f"{epoch_train_loss:.4f}", f"{epoch_train_acc:.2f}", f"{epoch_val_loss:.4f}", f"{epoch_val_acc:.2f}", f"{epoch_time:.0f}"]
         )
         log_file.flush()
 
-        # Uloženie checkpointu po každej epoche
+        # Uloženie najlepšieho checkpointu
+        state = {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "epoch": epoch,
+            "num_classes": num_classes,
+            "embedding_size": 512,
+            "best_val_acc": best_val_acc,
+        }
+        
         os.makedirs(os.path.dirname(CHECKPOINT_PATH), exist_ok=True)
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "epoch": epoch,
-                "num_classes": num_classes,
-                "embedding_size": 512,
-            },
-            CHECKPOINT_PATH,
-        )
-        print(f"Checkpoint uložený (epocha {epoch})")
+        # Ulož latest vždy
+        torch.save(state, CHECKPOINT_PATH)
+        
+        # Ak je to zatiaľ najlepší model, ulož ho špeciálne
+        if epoch_val_acc > best_val_acc:
+            best_val_acc = epoch_val_acc
+            state["best_val_acc"] = best_val_acc
+            best_model_path = CHECKPOINT_PATH.replace(".pth", "_best.pth")
+            torch.save(state, best_model_path)
+            print(f"Nový najlepší model uložený! (val_acc: {best_val_acc:.2f}%)")
 
     log_file.close()
-    print(f"Tréning dokončený. Model uložený do {CHECKPOINT_PATH}")
+    print(f"Tréning dokončený. Najlepší model má val_acc: {best_val_acc:.2f}%")
 
 
 if __name__ == "__main__":
