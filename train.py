@@ -18,7 +18,7 @@ BATCH_SIZE = 128
 EPOCHS = 30
 LR = 0.1
 DATA_DIR = "data/processed/casia"
-CHECKPOINT_PATH = "models/checkpoints/benchmark_cnn.pth"
+CHECKPOINT_PATH = "models/checkpoints/benchmark_cnn_best_run1.pth"
 LOG_PATH = "results/training_log.csv"
 
 
@@ -90,7 +90,7 @@ def main():
     model = BenchmarkCNN(num_classes=num_classes).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=5e-4)
+    optimizer = SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=1e-3)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
     # Mixed precision - zrýchli tréning na GPU použitím float16 kde je to bezpečné
@@ -216,6 +216,8 @@ def main():
             best_val_acc = epoch_val_acc
             state["best_val_acc"] = best_val_acc
             best_model_path = CHECKPOINT_PATH.replace(".pth", "_best.pth")
+            if "_best_best" in best_model_path:
+                 best_model_path = best_model_path.replace("_best_best", "_best")
             torch.save(state, best_model_path)
             print(f"Nový najlepší model uložený! (val_acc: {best_val_acc:.2f}%)")
 

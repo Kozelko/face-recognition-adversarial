@@ -4,22 +4,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 
-from models.wrappers import FaceNetWrapper, BenchmarkCNNWrapper
+from models.wrappers import FaceNetWrapper, BenchmarkCNNWrapper, ArcFaceWrapper, AdaFaceWrapper
 from attacks.fgsm import fgsm_attack_untargeted
 from attacks.pgd import pgd_attack_untargeted
+from attacks.bim import bim_attack_untargeted
+from attacks.mifgsm import mifgsm_attack_untargeted
 
 def denormalize(tensor):
-    """
-    Konvertuje tenzor z rozsahu [-1, 1] späť na [0, 1] pre zobrazenie cez matplotlib.
-    Predpokladá normalizáciu: mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
-    """
+    # Konvertuje tenzor z rozsahu [-1, 1] späť na [0, 1] pre zobrazenie cez matplotlib.
+    # Predpokladá normalizáciu: mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
     tensor = tensor * 0.5 + 0.5
     return torch.clamp(tensor, 0.0, 1.0)
 
 def visualize_attack(orig_img, adv_img, diff_img, similarity, title="Útok", save_path="results/attack_visualization.png"):
-    """
-    Vykreslí pôvodný obrázok, adversariálny obrázok a vizualizuje aplikovaný šum.
-    """
+    # Vykreslí pôvodný obrázok, adversariálny obrázok a vizualizuje aplikovaný šum.
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     
     orig_np = denormalize(orig_img).squeeze().permute(1, 2, 0).cpu().numpy()
@@ -30,7 +28,7 @@ def visualize_attack(orig_img, adv_img, diff_img, similarity, title="Útok", sav
     diff_np = np.clip((diff_np * 10 + 0.5), 0, 1) 
     
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
-    fig.suptitle(f"{title} | Cosine Similarity po útoku: {similarity:.4f}", fontsize=14)
+    fig.suptitle(f"{title} | Cosine Sim po útoku: {similarity:.4f}", fontsize=14)
     
     axes[0].imshow(orig_np)
     axes[0].set_title("Pôvodný obrázok")
@@ -47,103 +45,105 @@ def visualize_attack(orig_img, adv_img, diff_img, similarity, title="Útok", sav
     plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
-    print(f"Vizualizácia útoku bola uložená do: {save_path}")
+    print(f"Vizualizácia uložená: {save_path}")
+
+def load_benchmark_cnn(device):
+    checkpoint_path = "models/checkpoints/benchmark_cnn_best_run1.pth"
+    if not os.path.exists(checkpoint_path):
+        print(f"Nemám checkpoint {checkpoint_path}")
+        return None
+    try:
+        # Pre prípad, ak model načítať priamo (často checkpoint obsahuje parametre)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        num_classes = checkpoint.get("num_classes", 10575)  # Fallback na CASIA-WebFace
+        model = BenchmarkCNNWrapper(num_classes=num_classes, checkpoint_path=checkpoint_path, device=device)
+        return model
+    except Exception as e:
+        print(f"Chyba pri načítaní BenchmarkCNN: {e}")
+        return None
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Používam zariadenie: {device}\n")
 
-    # 1. Načítanie modelu
-    print("Načítavam model (FaceNet)...")
-    model = FaceNetWrapper(device=device)
-    model.eval()
+    # 1. Príprava modelov
+    models_dict = {}
+    
+    print("Načítavam model: FaceNet...")
+    models_dict["FaceNet"] = FaceNetWrapper(device=device)
+    
+    print("Načítavam model: ArcFace...")
+    models_dict["ArcFace"] = ArcFaceWrapper(device=device)
+    
+    print("Načítavam model: AdaFace...")
+    models_dict["AdaFace"] = AdaFaceWrapper(device=device)
+    
+    print("Načítavam model: BenchmarkCNN...")
+    bcnn = load_benchmark_cnn(device)
+    if bcnn is not None:
+        models_dict["BenchmarkCNN"] = bcnn
 
     # 2. Príprava obrázka
-    # Skúsime načítať reálny obrázok z tvojho datasetu (CASIA)
     try:
         from torchvision import datasets, transforms
-        
-        # Transformácia, ktorú používaš v train.py
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ])
         dataset = datasets.ImageFolder("data/processed/casia", transform=transform)
-        # Zoberieme prvý obrázok
         image, label = dataset[0]
         image = image.unsqueeze(0).to(device)
         print("Načítaný skutočný obrázok z datasetu CASIA.")
     except Exception as e:
         print(f"Nepodarilo sa načítať dataset, použijem náhodný dummy obrázok. (Dôvod: {e})")
-        # Generujeme dummy obrázok s hodnotami priamo v rozsahu [-1, 1]
         image = torch.rand(1, 3, 112, 112).to(device) * 2 - 1
 
-    # 3. Získame pôvodný embedding
-    print("\nExtrahujem pôvodný embedding...")
-    with torch.no_grad():
-        orig_emb = model(image)
-
-    # 4. Aplikácia FGSM útoku
-    # Eps = 16/255 v rozsahu [-1, 1] je ekvivalent vizuálnej zmeny 8/255 v klasickom RGB
-    epsilon = 16 / 255.0 
-    print(f"Spúšťam FGSM útok (untargeted) s epsilon = {epsilon:.4f}...")
-    
-    adv_image = fgsm_attack_untargeted(model, image, epsilon=epsilon)
-
-    # 5. Vyhodnotenie útoku
-    print("\nExtrahujem embedding po útoku...")
-    with torch.no_grad():
-        adv_emb = model(adv_image)
-        
-    similarity = F.cosine_similarity(orig_emb, adv_emb).item()
-    
-    print(f"Vzdialenosť pred útokom (Cosine Sim): 1.0000")
-    print(f"Vzdialenosť po útoku  (Cosine Sim): {similarity:.4f}")
-    
-    # Pre FaceNet je bežný threshold zhody (rovnaká osoba) niekde okolo 0.5 - 0.6.
-    # Ak podobnosť klesne pod túto hranicu, systém tvár rozpozná ako "Neznámu" alebo ako niekoho iného.
-    threshold = 0.5
-    if similarity < threshold:
-        print(f"Útok bol ÚSPEŠNÝ! Podobnosť klesla pod threshold zhody ({threshold}).")
-    else:
-        print(f"Útok ZLYHAL. Podobnosť je príliš vysoká, model je stále presvedčený, že ide o rovnakú osobu.")
-
-    # 6. Vizualizácia FGSM
-    visualize_attack(
-        image, adv_image, adv_image - image, 
-        similarity, 
-        title="FaceNet - FGSM Dodging Attack", 
-        save_path="results/fgsm_test_facenet.png"
-    )
-
-    # 7. Aplikácia PGD útoku
-    # Použijeme menší krok (alpha) a 20 iterácií pre oveľa silnejší útok
-    alpha = (2 / 255.0) * 2  # Ekvivalent 2/255 v rozsahu [-1, 1]
+    # Definícia útokov
+    epsilon = 16 / 255.0
+    alpha = (2 / 255.0) * 2
     num_iter = 20
-    print(f"\nSpúšťam PGD útok (untargeted) s epsilon = {epsilon:.4f}, iterácií = {num_iter}...")
     
-    adv_image_pgd = pgd_attack_untargeted(model, image, epsilon=epsilon, alpha=alpha, num_iter=num_iter)
-    
-    # 8. Vyhodnotenie PGD útoku
-    print("\nExtrahujem embedding po PGD útoku...")
-    with torch.no_grad():
-        adv_emb_pgd = model(adv_image_pgd)
-        
-    similarity_pgd = F.cosine_similarity(orig_emb, adv_emb_pgd).item()
-    print(f"Vzdialenosť po PGD útoku (Cosine Sim): {similarity_pgd:.4f}")
-    
-    if similarity_pgd < threshold:
-        print(f"✅ PGD útok bol ÚSPEŠNÝ! Podobnosť klesla pod threshold zhody ({threshold}).")
-    else:
-        print(f"❌ PGD útok ZLYHAL. Podobnosť je stále príliš vysoká.")
+    attacks = {
+        "FGSM": lambda m, img: fgsm_attack_untargeted(m, img, epsilon=epsilon),
+        "PGD": lambda m, img: pgd_attack_untargeted(m, img, epsilon=epsilon, alpha=alpha, num_iter=num_iter),
+        "BIM": lambda m, img: bim_attack_untargeted(m, img, epsilon=epsilon, alpha=alpha, num_iter=num_iter),
+        "MI-FGSM": lambda m, img: mifgsm_attack_untargeted(m, img, epsilon=epsilon, alpha=alpha, num_iter=num_iter)
+    }
 
-    # 9. Vizualizácia PGD
-    visualize_attack(
-        image, adv_image_pgd, adv_image_pgd - image, 
-        similarity_pgd, 
-        title="FaceNet - PGD Dodging Attack", 
-        save_path="results/pgd_test_facenet.png"
-    )
+    threshold = 0.5
+
+    # 3. Spustenie útokov na každom modeli
+    for model_name, model in models_dict.items():
+        print(f"\n{'='*50}")
+        print(f"=== Testujem model: {model_name} ===")
+        print(f"{'='*50}")
+        
+        # Získame pôvodný embedding pre tento model
+        with torch.no_grad():
+            orig_emb = model(image)
+            
+        for attack_name, attack_fn in attacks.items():
+            print(f"\n--- Spúšťam útok: {attack_name} ---")
+            adv_image = attack_fn(model, image)
+            
+            with torch.no_grad():
+                adv_emb = model(adv_image)
+                
+            similarity = F.cosine_similarity(orig_emb, adv_emb).item()
+            print(f"Vzdialenosť po {attack_name} útoku (Cosine Sim): {similarity:.4f}")
+            
+            if similarity < threshold:
+                print(f"✅ Útok {attack_name} bol ÚSPEŠNÝ! Podobnosť klesla pod {threshold}.")
+            else:
+                print(f"❌ Útok {attack_name} ZLYHAL. Podobnosť je stále príliš vysoká.")
+
+            save_path = f"results/{attack_name.lower()}_test_{model_name.lower()}.png"
+            visualize_attack(
+                image, adv_image, adv_image - image, 
+                similarity, 
+                title=f"{model_name} - {attack_name} Dodging Attack", 
+                save_path=save_path
+            )
 
 if __name__ == "__main__":
     main()
