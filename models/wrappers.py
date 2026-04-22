@@ -3,29 +3,26 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class FaceModelWrapper(nn.Module):
-    """
-    Spoločné rozhranie pre modely tvárovej biometrie.
-    Každý wrapper zabezpečuje, že dopredný prechod (forward) 
-    vráti L2-normalizovaný embedding (vektor príznakov).
-    To nám zaručí, že adversariálne útoky budú môcť byť implementované
-    univerzálne nad týmto rozhraním.
-    """
+        # Spoločné rozhranie pre modely tvárovej biometrie.
+    # Každý wrapper zabezpečuje, že dopredný prechod (forward) 
+    # vráti L2-normalizovaný embedding (vektor príznakov).
+    # To nám zaručí, že adversariálne útoky budú môcť byť implementované
+    # univerzálne nad týmto rozhraním.
+
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
-        """
-        Vstup: Tenzor obrázkov tvaru (B, C, H, W).
-               Predpokladáme, že vstupné obrázky sú normalizované pre daný model
-               alebo použijeme transformáciu priamo tu.
-        Výstup: L2-normalizovaný tenzor embeddingov tvaru (B, embedding_size).
-        """
+                # Vstup: Tenzor obrázkov tvaru (B, C, H, W).
+        #        Predpokladáme, že vstupné obrázky sú normalizované pre daný model
+        #        alebo použijeme transformáciu priamo tu.
+        # Výstup: L2-normalizovaný tenzor embeddingov tvaru (B, embedding_size).
+
         raise NotImplementedError("Podtrieda musí implementovať metódu forward.")
 
 class BenchmarkCNNWrapper(FaceModelWrapper):
-    """
-    Wrapper pre náš vlastný natrénovaný model (BenchmarkCNN).
-    """
+        # Wrapper pre náš vlastný natrénovaný model (BenchmarkCNN).
+
     def __init__(self, num_classes, checkpoint_path=None, device="cpu"):
         super().__init__()
         from models.benchmark_cnn import BenchmarkCNN
@@ -48,9 +45,8 @@ class BenchmarkCNNWrapper(FaceModelWrapper):
         return F.normalize(emb, p=2, dim=1)
 
 class FaceNetWrapper(FaceModelWrapper):
-    """
-    Wrapper pre model FaceNet (InceptionResnetV1) z balíka facenet-pytorch.
-    """
+        # Wrapper pre model FaceNet (InceptionResnetV1) z balíka facenet-pytorch.
+
     def __init__(self, pretrained="vggface2", device="cpu"):
         super().__init__()
         try:
@@ -71,17 +67,70 @@ class FaceNetWrapper(FaceModelWrapper):
 
 class ArcFaceWrapper(FaceModelWrapper):
     """
-    Wrapper pre ArcFace model z InsightFace (alebo inej implementácie).
-    Momentálne pripravené ako štruktúra, bude sa dopĺňať po stiahnutí konkrétneho modelu.
+    Wrapper pre ArcFace model (napr. z InsightFace).
+    Používa štandardnú IResNet50 architektúru.
     """
-    def __init__(self, model_path=None, device="cpu"):
+    def __init__(self, model_path="models/checkpoints/arcface_iresnet50.pth", device="cpu"):
         super().__init__()
-        # Zatiaľ placeholder, implementácia sa doplní na základe toho,
-        # aké konkrétne váhy (ONNX / PyTorch pt) pre ArcFace použijem.
-        pass
+        import os
+        from models.iresnet import iresnet50
+        
+        self.model = iresnet50(num_features=512)
+        if os.path.exists(model_path):
+            checkpoint = torch.load(model_path, map_location=device)
+            # Podpora pre rôzne formáty uloženia PyTorch checkpointov
+            state_dict = checkpoint.get('state_dict', checkpoint)
+            # Vyčistenie kľúčov v prípade DataParallel
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            self.model.load_state_dict(state_dict, strict=False)
+            print(f"✅ ArcFace: Váhy úspešne načítané z {model_path}")
+        else:
+            print(f"⚠️ Upozornenie: ArcFace váhy nenájdené na '{model_path}'.")
+            print(f"             Model bude fungovať s náhodnými váhami (len pre ukážku frameworku).")
+            
+        self.model.to(device)
+        self.model.eval()
 
     def forward(self, x):
-        raise NotImplementedError("ArcFaceWrapper ešte nie je úplne implementovaný.")
+        emb = self.model(x)
+        return F.normalize(emb, p=2, dim=1)
+
+class AdaFaceWrapper(FaceModelWrapper):
+    """
+    Wrapper pre model AdaFace.
+    Využíva vlastnú implementáciu IResNet architektúry priamo z repozitára AdaFace.
+    """
+    def __init__(self, model_path="models/checkpoints/adaface_iresnet50.pth", device="cpu"):
+        super().__init__()
+        import os
+        
+        try:
+            from models.adaface_net import build_model
+            self.model = build_model('ir_50')
+            
+            if os.path.exists(model_path):
+                checkpoint = torch.load(model_path, map_location=device)
+                state_dict = checkpoint.get('state_dict', checkpoint)
+                
+                # AdaFace váhy začínajú prefixom 'model.'
+                state_dict = {k.replace('model.', ''): v for k, v in state_dict.items() if 'model.' in k}
+                self.model.load_state_dict(state_dict, strict=True)
+                print(f"✅ AdaFace: Váhy úspešne načítané z {model_path}")
+            else:
+                print(f"⚠️ Upozornenie: AdaFace váhy nenájdené na '{model_path}'.")
+                print(f"             Model bude fungovať s náhodnými váhami.")
+                
+            self.model.to(device)
+            self.model.eval()
+        except ImportError:
+            print("⚠️ Upozornenie: Modul models.adaface_net nenájdený, stiahnite net.py z repozitára AdaFace.")
+
+    def forward(self, x):
+        # AdaFace vracia ne-normalizovaný výstup, takže použijeme L2 normalizáciu pre kosínusovú podobnosť
+        emb = self.model(x)
+        if isinstance(emb, tuple):
+            emb = emb[0] # Niekedy modely vracajú viacero výstupov, chceme iba prvý (features)
+        return F.normalize(emb, p=2, dim=1)
 
 # Príklad použitia:
 if __name__ == "__main__":
