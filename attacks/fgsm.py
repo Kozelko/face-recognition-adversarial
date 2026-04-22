@@ -2,13 +2,12 @@ import torch
 import torch.nn.functional as F
 
 def fgsm_attack_untargeted(model, image, epsilon=8/255):
-    """
-    FGSM (Fast Gradient Sign Method) untargeted attack pre tvárovú biometriu.
-    Snaží sa čo najviac vzdialiť adversariálny embedding od pôvodného embeddingu
-    (minimalizovať kosínusovú podobnosť).
-    
-    Predpokladá vstupné obrázky normalizované v rozsahu [-1, 1] (podľa tvojho datasetu).
-    """
+        # FGSM (Fast Gradient Sign Method) untargeted attack pre tvárovú biometriu.
+    # Snaží sa čo najviac vzdialiť adversariálny embedding od pôvodného embeddingu
+    # (minimalizovať kosínusovú podobnosť).
+    #
+    # Predpokladá vstupné obrázky normalizované v rozsahu [-1, 1] (podľa tvojho datasetu).
+
     # Klonujeme vstup a pridáme veľmi jemný náhodný šum, aby sme rozbili symetriu.
     # Toto je kritický krok, pretože gradient kosínusovej podobnosti dvoch IDENTICKÝCH
     # normalizovaných vektorov je presne NULA. Bez šumu by sa obrázok vôbec nezmenil.

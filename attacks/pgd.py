@@ -2,13 +2,12 @@ import torch
 import torch.nn.functional as F
 
 def pgd_attack_untargeted(model, image, epsilon=8/255, alpha=2/255, num_iter=10):
-    """
-    PGD (Projected Gradient Descent) untargeted attack pre tvárovú biometriu.
-    Iteratívne aplikuje šum v smere gradientu na minimalizáciu kosínusovej podobnosti.
-    Po každom kroku projektuje perturbáciu späť do L-infinity okolia (epsilon).
-    
-    Predpokladá vstupné obrázky normalizované v rozsahu [-1, 1].
-    """
+        # PGD (Projected Gradient Descent) untargeted attack pre tvárovú biometriu.
+    # Iteratívne aplikuje šum v smere gradientu na minimalizáciu kosínusovej podobnosti.
+    # Po každom kroku projektuje perturbáciu späť do L-infinity okolia (epsilon).
+    #
+    # Predpokladá vstupné obrázky normalizované v rozsahu [-1, 1].
+
     # Originálny obrázok si uložíme pre projekciu
     orig_image = image.clone().detach()
     
