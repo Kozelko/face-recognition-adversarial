@@ -159,14 +159,16 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
         with gr.TabItem("⚔️ Testovanie útokov"):
             with gr.Row():
                 with gr.Column(scale=1):
+                    gr.Markdown("### 1. Krok: Vyber fotku")
                     # Vstup
                     input_image = gr.Image(sources=["upload", "webcam"], label="Vstupný obrázok (Webkamera / Upload)")
                     
+                    gr.Markdown("### 2. Krok: Nastav parametre")
                     # Nastavenia
                     model_dropdown = gr.Dropdown(
                         choices=list(models_dict.keys()), 
                         value="BenchmarkCNN", 
-                        label="Cieľový Model"
+                        label="Cieľový Model (Ktorý model chceš oklamať)"
                     )
                     attack_dropdown = gr.Dropdown(
                         choices=["FGSM", "PGD", "BIM", "MI-FGSM", "C&W"], 
@@ -181,11 +183,12 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                     attack_btn = gr.Button("🚀 Spustiť útok", variant="primary")
                 
                 with gr.Column(scale=2):
+                    gr.Markdown("### 3. Krok: Výsledok (Prežil model tvoj útok?)")
                     # Výstup
-                    status_output = gr.Textbox(label="Výsledok", lines=2)
+                    status_output = gr.Textbox(label="Vyhodnotenie", lines=2)
                     with gr.Row():
-                        adv_image_output = gr.Image(label="Adversariálny obrázok")
-                        noise_image_output = gr.Image(label="Zosilnený šum (x10)")
+                        adv_image_output = gr.Image(label="Adversariálny obrázok (Čo vidí model)")
+                        noise_image_output = gr.Image(label="Zosilnený šum (x10) (Aký bol pridaný šum)")
             
             attack_btn.click(
                 fn=run_attack,
