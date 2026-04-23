@@ -7,6 +7,7 @@ from datetime import datetime
 import shutil
 
 from evaluate_attacks import load_benchmark_cnn, denormalize
+from train_finetune import run_finetuning
 from models.wrappers import FaceNetWrapper, ArcFaceWrapper, AdaFaceWrapper
 from attacks.fgsm import fgsm_attack_untargeted
 from attacks.pgd import pgd_attack_untargeted
@@ -21,6 +22,20 @@ DATASET_DIR = "data/custom_dataset"
 # --- Načítanie modelov ---
 models_dict = {}
 
+def load_finetuned_cnn(device):
+    from models.wrappers import BenchmarkCNNWrapper
+    checkpoint_path = "models/checkpoints/benchmark_cnn_finetuned.pth"
+    if not os.path.exists(checkpoint_path):
+        return None
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        num_classes = checkpoint.get("num_classes", 10575)
+        model = BenchmarkCNNWrapper(num_classes=num_classes, checkpoint_path=checkpoint_path, device=device)
+        return model
+    except Exception as e:
+        print(f"Chyba pri načítaní Finetuned BenchmarkCNN: {e}")
+        return None
+
 def init_models():
     global models_dict
     if not models_dict:
@@ -31,6 +46,12 @@ def init_models():
         bcnn = load_benchmark_cnn(DEVICE)
         if bcnn is not None:
             models_dict["BenchmarkCNN"] = bcnn
+        
+        bcnn_finetuned = load_finetuned_cnn(DEVICE)
+        if bcnn_finetuned is not None:
+            models_dict["BenchmarkCNN (Finetuned)"] = bcnn_finetuned
+            print("✅ Finetuned BenchmarkCNN úspešne načítaný.")
+            
         print("Modely úspešne načítané.")
 
 # Inicializuj modely pri štarte aplikácie
@@ -118,6 +139,16 @@ def save_image_to_dataset(image, person_name):
     count = len(os.listdir(person_dir))
     return f"✅ Fotka úspešne uložená do {filepath}. Osoba '{person_name}' má teraz {count} fotiek."
 
+def handle_finetune(progress=gr.Progress()):
+    success, msg = run_finetuning(dataset_dir=DATASET_DIR, epochs=15, lr=0.001, progress=progress)
+    if success:
+        # Skús znovu načítať nový model do pamäte
+        bcnn_finetuned = load_finetuned_cnn(DEVICE)
+        if bcnn_finetuned is not None:
+            models_dict["BenchmarkCNN (Finetuned)"] = bcnn_finetuned
+            return msg, gr.update(choices=list(models_dict.keys()), value="BenchmarkCNN (Finetuned)")
+    return msg, gr.update()
+
 # --- Vytvorenie Gradio UI ---
 with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
     gr.Markdown("# 🛡️ Face Recognition & Adversarial Attacks Platform")
@@ -133,7 +164,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                     
                     # Nastavenia
                     model_dropdown = gr.Dropdown(
-                        choices=["FaceNet", "ArcFace", "AdaFace", "BenchmarkCNN"], 
+                        choices=list(models_dict.keys()), 
                         value="BenchmarkCNN", 
                         label="Cieľový Model"
                     )
@@ -183,13 +214,20 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                     3. Ostatné vrstvy (Feature Extractor) sa zmrazia, takže model nezabudne "ako vyzerá tvár", len sa doučí spojiť nové črty s tvojím menom. Trvá to veľmi krátko (niekoľko minút).
                     """)
                     
-                    # Tlačidlo pre spustenie trénovania - toto by neskôr volalo upravený train_finetune.py
-                    finetune_btn = gr.Button("🔄 Spustiť Fine-Tuning (Pripravuje sa...)", interactive=False)
+                    # Tlačidlo pre spustenie trénovania
+                    finetune_btn = gr.Button("🔄 Spustiť Fine-Tuning", variant="primary")
+                    finetune_status = gr.Textbox(label="Status Finetuningu")
                     
             save_btn.click(
                 fn=save_image_to_dataset,
                 inputs=[collect_image, person_name_input],
                 outputs=[save_status]
+            )
+            
+            finetune_btn.click(
+                fn=handle_finetune,
+                inputs=[],
+                outputs=[finetune_status, model_dropdown]
             )
 
 if __name__ == "__main__":
