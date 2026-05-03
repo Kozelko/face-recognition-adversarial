@@ -19,6 +19,10 @@ from attacks.cw import cw_l2_attack_untargeted
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATASET_DIR = "data/custom_dataset"
 
+# Inicializácia MTCNN pre detekciu tvárí pri zbere dát
+from facenet_pytorch import MTCNN
+mtcnn = MTCNN(image_size=112, margin=20, device=DEVICE, post_process=False)
+
 # --- Načítanie modelov ---
 models_dict = {}
 
@@ -50,7 +54,7 @@ def init_models():
         bcnn_finetuned = load_finetuned_cnn(DEVICE)
         if bcnn_finetuned is not None:
             models_dict["BenchmarkCNN (Finetuned)"] = bcnn_finetuned
-            print("✅ Finetuned BenchmarkCNN úspešne načítaný.")
+            print("Finetuned BenchmarkCNN úspešne načítaný.")
             
         print("Modely úspešne načítané.")
 
@@ -103,7 +107,7 @@ def run_attack(image, model_name, attack_name, epsilon, alpha, num_iter):
     diff_np = (adv_tensor - img_tensor).squeeze().permute(1, 2, 0).cpu().numpy()
     diff_np = (diff_np * 10 + 0.5).clip(0, 1)  # Zosilnené 10x
     
-    status_text = f"✅ Cosine Similarity: {similarity:.4f}\n"
+    status_text = f"Cosine Similarity: {similarity:.4f}\n"
     if similarity < 0.5:
         status_text += "Útok bol úspešný! Model bol oklamaný."
     else:
@@ -114,10 +118,24 @@ def run_attack(image, model_name, attack_name, epsilon, alpha, num_iter):
 # --- Funkcie pre záložku 2: Zber dát ---
 def save_image_to_dataset(image, person_name):
     if image is None:
-        return "⚠️ Žiadny obrázok na uloženie."
+        return "Žiadny obrázok na uloženie."
     if not person_name or person_name.strip() == "":
-        return "⚠️ Prosím, zadaj meno osoby."
+        return "Prosím, zadaj meno osoby."
     
+    # Detekcia tváre cez MTCNN
+    from PIL import Image
+    import numpy as np
+    
+    # Prevod numpy array na PIL Image
+    pil_img = Image.fromarray(image)
+    
+    # Skús nájsť tvár
+    # mtcnn vráti orezaný tenzor (3, 112, 112)
+    face_tensor = mtcnn(pil_img)
+    
+    if face_tensor is None:
+        return "Na fotke sa nepodarilo nájsť žiadnu tvár! Skús sa posunúť bližšie k svetlu alebo k webkamere."
+
     person_name = person_name.strip().replace(" ", "_")
     person_dir = os.path.join(DATASET_DIR, person_name)
     os.makedirs(person_dir, exist_ok=True)
@@ -127,17 +145,18 @@ def save_image_to_dataset(image, person_name):
     filename = f"{timestamp}.jpg"
     filepath = os.path.join(person_dir, filename)
     
-    # Gradio image je RGB numpy array, cv2 používa BGR
-    img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    # Konverzia tenzoru späť na obrázok a uloženie
+    # face_tensor je v rozsahu [0, 255] (vďaka post_process=False)
+    face_np = face_tensor.permute(1, 2, 0).byte().cpu().numpy()
+    img_bgr = cv2.cvtColor(face_np, cv2.COLOR_RGB2BGR)
     
-    # Tu by sa ideálne zišlo pridať detekciu tváre (napr. MTCNN) a orezanie na 112x112
-    # Pre zjednodušenie ukladáme zatiaľ ako 112x112 (rezize)
-    img_resized = cv2.resize(img_bgr, (112, 112))
-    
-    cv2.imwrite(filepath, img_resized)
+    cv2.imwrite(filepath, img_bgr)
     
     count = len(os.listdir(person_dir))
-    return f"✅ Fotka úspešne uložená do {filepath}. Osoba '{person_name}' má teraz {count} fotiek."
+    status_msg = f"Tvár uložená! ({count}. fotka)"
+    
+    # Vrátime status a náhľad orezanej tváre. Vstup (webkameru) už neresetujeme, lebo beží v streamingu.
+    return status_msg, face_np
 
 def handle_finetune(progress=gr.Progress()):
     success, msg = run_finetuning(dataset_dir=DATASET_DIR, epochs=15, lr=0.001, progress=progress)
@@ -151,12 +170,12 @@ def handle_finetune(progress=gr.Progress()):
 
 # --- Vytvorenie Gradio UI ---
 with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
-    gr.Markdown("# 🛡️ Face Recognition & Adversarial Attacks Platform")
+    gr.Markdown("# Face Recognition & Adversarial Attacks Platform")
     gr.Markdown("Prototyp pre testovanie adversariálnych útokov a zber dát.")
     
     with gr.Tabs():
         # TAB 1: Testovanie útokov
-        with gr.TabItem("⚔️ Testovanie útokov"):
+        with gr.TabItem("Testovanie útokov"):
             with gr.Row():
                 with gr.Column(scale=1):
                     gr.Markdown("### 1. Krok: Vyber fotku")
@@ -180,7 +199,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                     alpha_slider = gr.Slider(minimum=1/255.0, maximum=10/255.0, value=2/255.0, step=1/255.0, label="Alpha (Krok pre PGD/BIM/MI-FGSM)")
                     iter_slider = gr.Slider(minimum=1, maximum=500, value=20, step=1, label="Počet iterácií (PGD=20, C&W=100+)")
                     
-                    attack_btn = gr.Button("🚀 Spustiť útok", variant="primary")
+                    attack_btn = gr.Button("Spustiť útok", variant="primary")
                 
                 with gr.Column(scale=2):
                     gr.Markdown("### 3. Krok: Výsledok (Prežil model tvoj útok?)")
@@ -197,34 +216,65 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
             )
             
         # TAB 2: Zber dát
-        with gr.TabItem("📸 Zber dát a Finetuning"):
+        with gr.TabItem("Zber dát a Finetuning"):
             with gr.Row():
                 with gr.Column():
-                    gr.Markdown("### Pridanie nových tvárí do custom datasetu")
-                    collect_image = gr.Image(sources=["webcam", "upload"], label="Webkamera")
-                    person_name_input = gr.Textbox(label="Meno osoby (napr. janko_hrasko)", placeholder="Zadaj meno a stlač 'Uložiť'")
-                    save_btn = gr.Button("💾 Uložiť fotku", variant="primary")
+                    gr.Markdown("### 1. Pridanie nových tvárí")
+                    
+                    input_type = gr.Radio(
+                        ["Webkamera", "Nahrať súbor"], 
+                        value="Webkamera", 
+                        label="Zdroj obrázka"
+                    )
+                    
+                    # Webkamera (zobrazená defaultne)
+                    collect_webcam = gr.Image(
+                        sources=["webcam"], 
+                        streaming=True, 
+                        label="Živý náhľad", 
+                        visible=True
+                    )
+                    # Upload (schovaný defaultne)
+                    collect_upload = gr.Image(
+                        sources=["upload"], 
+                        label="Nahrať fotku", 
+                        visible=False
+                    )
+                    
+                    person_name_input = gr.Textbox(label="Meno osoby", placeholder="napr. janko_s_bradou")
+                    save_btn = gr.Button("Uložiť tento záber / fotku", variant="primary")
+                    
                     save_status = gr.Textbox(label="Status")
+                    cropped_preview = gr.Image(label="Náhľad orezanej tváre (Čo model uložil)")
                     
                 with gr.Column():
-                    gr.Markdown("### Dotrénovanie (Fine-Tuning)")
-                    gr.Markdown("""
-                    Ak si nazbieral nové fotky, môžeš model naučiť rozpoznávať tieto nové tváre technikou **Transfer Learning / Fine-Tuning**.
+                    gr.Markdown("### 2. Dotrénovanie (Fine-Tuning)")
                     
-                    **Ako to funguje:**
-                    1. Model sa nenačíta s náhodnými váhami, ale s už natrénovanými váhami (z tvojho checkpointu).
-                    2. Posledná vrstva (klasifikátor), ktorá doteraz rozoznávala napr. 10000 ľudí, sa "odreže" a nahradí novou, ktorá rozpoznáva tvoje nové identity (napr. +1 nová osoba).
-                    3. Ostatné vrstvy (Feature Extractor) sa zmrazia, takže model nezabudne "ako vyzerá tvár", len sa doučí spojiť nové črty s tvojím menom. Trvá to veľmi krátko (niekoľko minút).
-                    """)
-                    
-                    # Tlačidlo pre spustenie trénovania
                     finetune_btn = gr.Button("🔄 Spustiť Fine-Tuning", variant="primary")
                     finetune_status = gr.Textbox(label="Status Finetuningu")
-                    
+
+            # Logika prepínania viditeľnosti
+            def toggle_input(choice):
+                if choice == "Webkamera":
+                    return gr.update(visible=True), gr.update(visible=False)
+                else:
+                    return gr.update(visible=False), gr.update(visible=True)
+
+            input_type.change(
+                fn=toggle_input, 
+                inputs=[input_type], 
+                outputs=[collect_webcam, collect_upload]
+            )
+            
+            # Upravená funkcia ukladania (berie buď jeden alebo druhý vstup)
+            def unified_save(web_img, up_img, name, mode):
+                img = web_img if mode == "Webkamera" else up_img
+                return save_image_to_dataset(img, name)
+
             save_btn.click(
-                fn=save_image_to_dataset,
-                inputs=[collect_image, person_name_input],
-                outputs=[save_status]
+                fn=unified_save,
+                inputs=[collect_webcam, collect_upload, person_name_input, input_type],
+                outputs=[save_status, cropped_preview]
             )
             
             finetune_btn.click(
