@@ -86,12 +86,13 @@ class ArcFaceWrapper(FaceModelWrapper):
             print(f"✅ ArcFace: Váhy úspešne načítané z {model_path}")
         else:
             print(f"⚠️ Upozornenie: ArcFace váhy nenájdené na '{model_path}'.")
-            print(f"             Model bude fungovať s náhodnými váhami (len pre ukážku frameworku).")
             
-        self.model.to(device)
+        self.model = self.model.to(device)
         self.model.eval()
 
     def forward(self, x):
+        # Zabezpečíme, že vstup je na rovnakom zariadení ako model
+        x = x.to(next(self.model.parameters()).device)
         emb = self.model(x)
         return F.normalize(emb, p=2, dim=1)
 
@@ -118,18 +119,17 @@ class AdaFaceWrapper(FaceModelWrapper):
                 print(f"✅ AdaFace: Váhy úspešne načítané z {model_path}")
             else:
                 print(f"⚠️ Upozornenie: AdaFace váhy nenájdené na '{model_path}'.")
-                print(f"             Model bude fungovať s náhodnými váhami.")
                 
-            self.model.to(device)
+            self.model = self.model.to(device)
             self.model.eval()
         except ImportError:
-            print("⚠️ Upozornenie: Modul models.adaface_net nenájdený, stiahnite net.py z repozitára AdaFace.")
+            print("⚠️ Upozornenie: Modul models.adaface_net nenájdený.")
 
     def forward(self, x):
-        # AdaFace vracia ne-normalizovaný výstup, takže použijeme L2 normalizáciu pre kosínusovú podobnosť
+        x = x.to(next(self.model.parameters()).device)
         emb = self.model(x)
         if isinstance(emb, tuple):
-            emb = emb[0] # Niekedy modely vracajú viacero výstupov, chceme iba prvý (features)
+            emb = emb[0] 
         return F.normalize(emb, p=2, dim=1)
 
 # Príklad použitia:

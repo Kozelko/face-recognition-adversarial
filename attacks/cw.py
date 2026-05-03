@@ -16,14 +16,20 @@ def cw_l2_attack_untargeted(model, images, c=1e-4, kappa=0, max_iter=1000, learn
     imgs_01 = (images + 1.0) / 2.0
     # Aby sme predišli nekonečnu, orežeme trochu od okrajov
     imgs_01 = torch.clamp(imgs_01, 1e-5, 1.0 - 1e-5)
-    w = torch.zeros_like(imgs_01).to(device)
+    # 1. Korektná inicializácia w (inverzná funkcia k 0.5*(tanh(w)+1))
+    # w = atanh(2*x - 1)
+    w = torch.atanh(torch.clamp(2.0 * imgs_01 - 1.0, min=-1.0 + 1e-6, max=1.0 - 1e-6)).to(device)
     w.requires_grad = True
 
     # Pôvodné embeddingy (cieľ, od ktorého sa chceme vzdialiť)
     with torch.no_grad():
         orig_embs = model(images).detach()
 
-    optimizer = optim.Adam([w], lr=learning_rate)
+    # Väčšia hodnota C zabezpečí, že model bude mať vyššiu prioritu ako L2 vzdialenosť
+    # Pre embeddingy potrebujeme vyššie C (aspoň 10.0), aby útok prekonal L2 penalizáciu
+    c = 10.0 if c == 1e-4 else c 
+    
+    optimizer = optim.Adam([w], lr=learning_rate * 2)
 
     for step in range(max_iter):
         # 1. Transformácia z w späť do [-1, 1]
