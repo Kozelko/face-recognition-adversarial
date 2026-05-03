@@ -16,8 +16,8 @@ from attacks.cw import cw_l2_attack_untargeted
 
 # --- Nastavenia ---
 DATA_DIR = "data/processed/casia"
-BATCH_SIZE = 64
-NUM_TEST_IMAGES = 2000  # Otestujeme na náhodnej vzorke 2000 obrázkov
+BATCH_SIZE = 32  # Znížené z 64 na 32 kvôli kapacite VRAM (6GB na RTX 3060) pri väčších modeloch ako ArcFace
+NUM_TEST_IMAGES = 2000  # Finálny test pre diplomovku
 THRESHOLD = 0.5         # Hranica cosine similarity pre oklamanie modelu
 RESULTS_FILE = "results/batched_evaluation.csv"
 
@@ -78,7 +78,7 @@ def main():
         "PGD": lambda m, img: pgd_attack_untargeted(m, img, epsilon=EPSILON, alpha=ALPHA, num_iter=NUM_ITER),
         "BIM": lambda m, img: bim_attack_untargeted(m, img, epsilon=EPSILON, alpha=ALPHA, num_iter=NUM_ITER),
         "MI-FGSM": lambda m, img: mifgsm_attack_untargeted(m, img, epsilon=EPSILON, alpha=ALPHA, num_iter=NUM_ITER),
-        "C&W": lambda m, img: cw_l2_attack_untargeted(m, img, max_iter=100) # Minimálne 100 iterácií pre zmysluplný výsledok C&W
+        "C&W": lambda m, img: cw_l2_attack_untargeted(m, img, max_iter=100) # 100 iterácií by malo s novými parametrami stačiť
     }
 
     # Príprava na ukladanie výsledkov
@@ -105,6 +105,8 @@ def main():
             total_images_processed = 0
             successful_attacks = 0  # Počet obrázkov, kde similarity klesla pod THRESHOLD
             avg_similarity_drop = 0.0
+            avg_l2_norm = 0.0
+            avg_linf_norm = 0.0
 
             for batch_idx, (images, labels) in enumerate(test_loader):
                 images = images.to(device)
@@ -123,10 +125,19 @@ def main():
                 # 4. Vypočítaj Cosine Similarity pre celý batch
                 similarities = F.cosine_similarity(orig_embs, adv_embs)
                 
+                # Výpočet veľkosti šumu (perturbácie)
+                perturbation = adv_images - images
+                # L2 norma (celková energia šumu) - prepočítaná na batch
+                l2 = torch.norm(perturbation.view(perturbation.size(0), -1), p=2, dim=1).sum().item()
+                # L_inf norma (maximálna zmena pixelu)
+                linf = torch.norm(perturbation.view(perturbation.size(0), -1), p=float('inf'), dim=1).sum().item()
+                
                 # 5. Vyhodnoť úspešnosť v batchi
                 batch_success = (similarities < THRESHOLD).sum().item()
                 successful_attacks += batch_success
                 avg_similarity_drop += similarities.sum().item()
+                avg_l2_norm += l2
+                avg_linf_norm += linf
                 total_images_processed += len(images)
                 
                 # Progres v konzole
@@ -139,20 +150,29 @@ def main():
             # Výpočet finálnych metrík
             success_rate = (successful_attacks / total_images_processed) * 100
             mean_sim = avg_similarity_drop / total_images_processed
+            mean_l2 = avg_l2_norm / total_images_processed
+            mean_linf = avg_linf_norm / total_images_processed
+            time_per_image = (elapsed / total_images_processed) * 1000 # v milisekundách
             
             print(f"-> Úspešnosť útoku (Success Rate): {success_rate:.2f}% (Similarity < {THRESHOLD})")
             print(f"-> Priemerná Cosine Sim. po útoku: {mean_sim:.4f}")
-            print(f"-> Trvanie: {elapsed:.2f} s")
+            print(f"-> Priemerný L2 šum: {mean_l2:.4f}, L_inf šum: {mean_linf:.4f}")
+            print(f"-> Trvanie: {elapsed:.2f} s ({time_per_image:.2f} ms / obrázok)")
 
             # Ulož výsledok
             results.append({
                 "Model": model_name,
                 "Attack": attack_name,
+                "Num_Images": total_images_processed,
+                "Batch_Size": BATCH_SIZE,
                 "Epsilon": EPSILON,
                 "Num_Iter": NUM_ITER if attack_name != "FGSM" else 1,
                 "Success_Rate_pct": round(success_rate, 2),
                 "Mean_Similarity": round(mean_sim, 4),
-                "Time_Seconds": round(elapsed, 2)
+                "Mean_L2_Noise": round(mean_l2, 4),
+                "Mean_Linf_Noise": round(mean_linf, 4),
+                "Time_Seconds": round(elapsed, 2),
+                "Time_Per_Image_ms": round(time_per_image, 2)
             })
             
             # Priebežne ukladaj do CSV
