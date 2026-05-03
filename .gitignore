@@ -1,4 +1,26 @@
+# Datasets and checkpoints
 data/
 models/checkpoints/
+
+# Python / Environment
 __pycache__/
 .env/
+.venv/
+env/
+venv/
+*.pyc
+
+# Project specific results
+results/*.png
+results/*.csv
+
+# Temporary Gradio files
+.gradio/
+
+# Research articles and final outputs
+clanky/
+*.pdf
+
+# IDE settings
+.vscode/
+.idea/
