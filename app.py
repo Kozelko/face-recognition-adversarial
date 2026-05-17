@@ -118,9 +118,9 @@ def run_attack(image, model_name, attack_name, epsilon, alpha, num_iter):
 # --- Funkcie pre záložku 2: Zber dát ---
 def save_image_to_dataset(image, person_name):
     if image is None:
-        return "Žiadny obrázok na uloženie."
+        return "⚠️ Žiadny obrázok na uloženie.", None
     if not person_name or person_name.strip() == "":
-        return "Prosím, zadaj meno osoby."
+        return "⚠️ Prosím, zadaj meno osoby.", None
     
     # Detekcia tváre cez MTCNN
     from PIL import Image
@@ -134,7 +134,7 @@ def save_image_to_dataset(image, person_name):
     face_tensor = mtcnn(pil_img)
     
     if face_tensor is None:
-        return "Na fotke sa nepodarilo nájsť žiadnu tvár! Skús sa posunúť bližšie k svetlu alebo k webkamere."
+        return "❌ Na fotke sa nepodarilo nájsť žiadnu tvár! Skús sa posunúť bližšie k svetlu alebo k webkamere.", None
 
     person_name = person_name.strip().replace(" ", "_")
     person_dir = os.path.join(DATASET_DIR, person_name)
@@ -187,7 +187,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                     model_dropdown = gr.Dropdown(
                         choices=list(models_dict.keys()), 
                         value="BenchmarkCNN", 
-                        label="Cieľový Model (Ktorý model chceš oklamať)"
+                        label="Cieľový Model"
                     )
                     attack_dropdown = gr.Dropdown(
                         choices=["FGSM", "PGD", "BIM", "MI-FGSM", "C&W"], 
@@ -202,7 +202,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                     attack_btn = gr.Button("Spustiť útok", variant="primary")
                 
                 with gr.Column(scale=2):
-                    gr.Markdown("### 3. Krok: Výsledok (Prežil model tvoj útok?)")
+                    gr.Markdown("### 3. Krok: Výsledok")
                     # Výstup
                     status_output = gr.Textbox(label="Vyhodnotenie", lines=2)
                     with gr.Row():
@@ -230,8 +230,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                     # Webkamera (zobrazená defaultne)
                     collect_webcam = gr.Image(
                         sources=["webcam"], 
-                        streaming=True, 
-                        label="Živý náhľad", 
+                        label="Webkamera (Klikni na foťák v strede pre odfotenie)", 
                         visible=True
                     )
                     # Upload (schovaný defaultne)
@@ -242,7 +241,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                     )
                     
                     person_name_input = gr.Textbox(label="Meno osoby", placeholder="napr. janko_s_bradou")
-                    save_btn = gr.Button("Uložiť tento záber / fotku", variant="primary")
+                    save_btn = gr.Button("Uložiť fotku", variant="primary")
                     
                     save_status = gr.Textbox(label="Status")
                     cropped_preview = gr.Image(label="Náhľad orezanej tváre (Čo model uložil)")
@@ -250,7 +249,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                 with gr.Column():
                     gr.Markdown("### 2. Dotrénovanie (Fine-Tuning)")
                     
-                    finetune_btn = gr.Button("🔄 Spustiť Fine-Tuning", variant="primary")
+                    finetune_btn = gr.Button("Spustiť Fine-Tuning", variant="primary")
                     finetune_status = gr.Textbox(label="Status Finetuningu")
 
             # Logika prepínania viditeľnosti
@@ -269,12 +268,17 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
             # Upravená funkcia ukladania (berie buď jeden alebo druhý vstup)
             def unified_save(web_img, up_img, name, mode):
                 img = web_img if mode == "Webkamera" else up_img
-                return save_image_to_dataset(img, name)
+                status_msg, face_np, _ = save_image_to_dataset(img, name)
+                # Ak sme vo webkamere, vrátime None pre vymazanie obrazu, čím sa kamera vráti do živého náhľadu
+                if mode == "Webkamera":
+                    return status_msg, face_np, None
+                else:
+                    return status_msg, face_np, gr.update()
 
             save_btn.click(
                 fn=unified_save,
                 inputs=[collect_webcam, collect_upload, person_name_input, input_type],
-                outputs=[save_status, cropped_preview]
+                outputs=[save_status, cropped_preview, collect_webcam]
             )
             
             finetune_btn.click(
