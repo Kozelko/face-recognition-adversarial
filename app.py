@@ -230,7 +230,8 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                     # Webkamera (zobrazená defaultne)
                     collect_webcam = gr.Image(
                         sources=["webcam"], 
-                        label="Webkamera (Klikni na foťák v strede pre odfotenie)", 
+                        streaming=True, 
+                        label="Živý náhľad (Stlač Uložiť pre odfotenie)", 
                         visible=True
                     )
                     # Upload (schovaný defaultne)
@@ -268,17 +269,13 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
             # Upravená funkcia ukladania (berie buď jeden alebo druhý vstup)
             def unified_save(web_img, up_img, name, mode):
                 img = web_img if mode == "Webkamera" else up_img
-                status_msg, face_np, _ = save_image_to_dataset(img, name)
-                # Ak sme vo webkamere, vrátime None pre vymazanie obrazu, čím sa kamera vráti do živého náhľadu
-                if mode == "Webkamera":
-                    return status_msg, face_np, None
-                else:
-                    return status_msg, face_np, gr.update()
+                status_msg, face_np = save_image_to_dataset(img, name)
+                return status_msg, face_np
 
             save_btn.click(
                 fn=unified_save,
                 inputs=[collect_webcam, collect_upload, person_name_input, input_type],
-                outputs=[save_status, cropped_preview, collect_webcam]
+                outputs=[save_status, cropped_preview]
             )
             
             finetune_btn.click(
