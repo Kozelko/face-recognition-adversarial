@@ -1,11 +1,10 @@
-"""
-Predspracovanie datasetov CASIA-WebFace a LFW pomocou MTCNN.
-MTCNN detekuje tvár, zarovná ju podľa očí a oreže na 112x112 pixelov.
-Výsledky sa ukladajú do data/processed/ v rovnakej adresárovej štruktúre.
+# Predspracovanie datasetov CASIA-WebFace a LFW pomocou MTCNN.
+# MTCNN detekuje tvár, zarovná ju podľa očí a oreže na 112x112 pixelov.
+# Výsledky sa ukladajú do data/processed/ v rovnakej adresárovej štruktúre.
+#
+# Používa multiprocessing — každý worker má vlastnú MTCNN inštanciu na CPU,
+# čo umožňuje paralelné spracovanie na viacerých jadrách.
 
-Používa multiprocessing — každý worker má vlastnú MTCNN inštanciu na CPU,
-čo umožňuje paralelné spracovanie na viacerých jadrách.
-"""
 
 import argparse
 import multiprocessing as mp
@@ -18,7 +17,8 @@ from tqdm import tqdm
 
 
 def _worker_init(device: str) -> None:
-    """Inicializuje MTCNN v každom worker procese."""
+        # Inicializuje MTCNN v každom worker procese.
+
     import torch
 
     torch.set_num_threads(1)  # každý worker 1 vlákno — zamedzí contention
@@ -34,7 +34,8 @@ def _worker_init(device: str) -> None:
 
 
 def _worker_process(args: tuple[str, str]) -> bool:
-    """Spracuje jeden obrázok. Vracia True ak OK, False ak skip."""
+        # Spracuje jeden obrázok. Vracia True ak OK, False ak skip.
+
     src_path, dst_path = args
     try:
         img = Image.open(src_path).convert("RGB")
@@ -57,11 +58,11 @@ def process_dataset(
     device: str,
     num_workers: int,
 ) -> tuple[int, int]:
-    """Spracuje dataset - detekuje a oreže tváre.
+        # Spracuje dataset - detekuje a oreže tváre.
+    #
+    # Returns:
+    #     (processed, skipped) počet úspešne spracovaných a preskočených obrázkov.
 
-    Returns:
-        (processed, skipped) počet úspešne spracovaných a preskočených obrázkov.
-    """
     src_path = Path(src_root)
     dst_path = Path(dst_root)
 

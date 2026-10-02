@@ -1,48 +1,65 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 class FaceModelWrapper(nn.Module):
-        # Spoločné rozhranie pre modely tvárovej biometrie.
-    # Každý wrapper zabezpečuje, že dopredný prechod (forward) 
-    # vráti L2-normalizovaný embedding (vektor príznakov).
-    # To nám zaručí, že adversariálne útoky budú môcť byť implementované
-    # univerzálne nad týmto rozhraním.
-
     def __init__(self):
         super().__init__()
 
     def forward(self, x):
-                # Vstup: Tenzor obrázkov tvaru (B, C, H, W).
-        #        Predpokladáme, že vstupné obrázky sú normalizované pre daný model
-        #        alebo použijeme transformáciu priamo tu.
-        # Výstup: L2-normalizovaný tenzor embeddingov tvaru (B, embedding_size).
-
         raise NotImplementedError("Podtrieda musí implementovať metódu forward.")
 
 class BenchmarkCNNWrapper(FaceModelWrapper):
-        # Wrapper pre náš vlastný natrénovaný model (BenchmarkCNN).
-
-    def __init__(self, num_classes, checkpoint_path=None, device="cpu"):
+    def __init__(self, num_classes=None, checkpoint_path=None, device="cpu"):
         super().__init__()
         from models.benchmark_cnn import BenchmarkCNN
         
-        self.model = BenchmarkCNN(num_classes=num_classes)
-        if checkpoint_path:
+        checkpoint = None
+        if checkpoint_path and os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
-            if "model_state_dict" in checkpoint:
+            if num_classes is None:
+                state = checkpoint.get("model_state_dict", checkpoint)
+                if isinstance(state, dict) and "classifier.weight" in state:
+                    num_classes = state["classifier.weight"].shape[0]
+                elif isinstance(checkpoint, dict) and "num_classes" in checkpoint:
+                    num_classes = checkpoint["num_classes"]
+
+        if num_classes is None:
+            num_classes = 10572
+        
+        self.model = BenchmarkCNN(num_classes=num_classes)
+        if checkpoint is not None:
+            if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
                 self.model.load_state_dict(checkpoint["model_state_dict"])
             else:
                 self.model.load_state_dict(checkpoint)
         
         self.model.to(device)
-        self.model.eval() # Vždy používam modely v eval() móde pre útoky
+        self.model.eval()
+        self.classes = checkpoint.get("classes", None) if (checkpoint and isinstance(checkpoint, dict)) else None
 
     def forward(self, x):
-        # Získame vnútorný embedding (pred klasifikačnou vrstvou)
         emb = self.model(x, return_embedding=True)
-        # Normalizácia embeddingu (štandard v tvárovej biometrii)
         return F.normalize(emb, p=2, dim=1)
+
+    def predict_identity(self, x):
+        """Vráti predikciu triedy a pravdepodobnosti, ak má model finetuned klasifikačnú hlavu."""
+        if not self.classes:
+            return None
+        x = x.to(next(self.model.parameters()).device)
+        with torch.no_grad():
+            logits = self.model(x, return_embedding=False)
+            probs = F.softmax(logits, dim=1)
+            conf, idx = torch.max(probs, dim=1)
+            label = self.classes[idx.item()]
+            readable_label = "Peter Brandajský" if "brandajsky" in label or "peter" in label else label.replace("_", " ").title()
+            return {
+                "raw_label": label,
+                "label": readable_label,
+                "confidence": conf.item(),
+                "probabilities": {self.classes[i]: probs[0, i].item() for i in range(len(self.classes))}
+            }
 
 class FaceNetWrapper(FaceModelWrapper):
         # Wrapper pre model FaceNet (InceptionResnetV1) z balíka facenet-pytorch.
@@ -126,7 +143,7 @@ class AdaFaceWrapper(FaceModelWrapper):
             print("⚠️ Upozornenie: Modul models.adaface_net nenájdený.")
 
     def forward(self, x):
-        x = x.to(next(self.model.parameters()).device)
+        x = x.to(next(self.model.parameters()).device).contiguous()
         emb = self.model(x)
         if isinstance(emb, tuple):
             emb = emb[0] 

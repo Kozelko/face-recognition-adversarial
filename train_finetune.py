@@ -79,8 +79,9 @@ def run_finetuning(dataset_dir="data/custom_dataset", epochs=15, lr=0.001, progr
     if progress:
         progress(0.2, desc=f"Spúšťam trénovanie na {num_classes} triedach...")
 
-    # 7. Trénovacia slučka
-    model.train()
+    # 7. Trénovacia slučka (Backbone v eval móde, trénujeme len klasifikátor)
+    model.eval()
+    model.classifier.train()
     for epoch in range(1, epochs + 1):
         total_loss = 0.0
         correct = 0
