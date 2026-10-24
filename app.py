@@ -376,12 +376,14 @@ def run_identify(image, model_name, ensemble_mode=""):
     
     status = "Test rozpoznania identity (živá kamera / fotka)\n"
     status += f"Cieľový model: {model_name} | Detekcia: {method} (112x112 px)"
+    holdout_model_name = None
     if "Samostatný" in str(ensemble_mode):
         status += " | Režim: Samostatný model (White-Box)"
     elif "Plný" in str(ensemble_mode):
         status += " | Režim: Plný Ensemble 4 modelov"
     elif "Ensemble" in str(ensemble_mode) or "Black-Box" in str(ensemble_mode):
         status += f" | Režim: Black-Box cieľ ({model_name})"
+        holdout_model_name = model_name
     if pad_detector is not None:
         with torch.no_grad():
             p_live = float(pad_detector(img_tensor).mean().item())
