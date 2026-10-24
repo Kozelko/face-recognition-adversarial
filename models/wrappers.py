@@ -1,13 +1,29 @@
 import os
+import math
+import ctypes
+try:
+    ctypes.CDLL('/home/kozel/miniconda/envs/cnn-benchmark/lib/libpng16.so.16', mode=ctypes.RTLD_GLOBAL)
+except Exception:
+    pass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+def _pool_stage(feat: torch.Tensor, grid: int = 2) -> torch.Tensor:
+    """Priestoro-kanálový mid-level deskriptor: adaptive pool na (grid, grid) kvadranty
+    s L2 normalizáciou na vrstvu, aby žiadna vrstva s veľkou BatchNorm škálou neprebila ostatné."""
+    pooled = F.adaptive_avg_pool2d(feat, (grid, grid)).flatten(1)
+    return F.normalize(pooled, p=2, dim=1)
+
 
 class FaceModelWrapper(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, x):
+    def forward(self, x, return_raw: bool = False):
+        """Vráti L2-normalizovaný embedding; s return_raw=True vráti (norm, multi_stage_feat)
+        kde multi_stage_feat kombinuje priestorové konvolučné mapy stredných a hlbokých
+        vrstiev so zachovaním magnitúdy pre feature-dominance black-box transfer."""
         raise NotImplementedError("Podtrieda musí implementovať metódu forward.")
 
 class BenchmarkCNNWrapper(FaceModelWrapper):
@@ -39,9 +55,24 @@ class BenchmarkCNNWrapper(FaceModelWrapper):
         self.model.eval()
         self.classes = checkpoint.get("classes", None) if (checkpoint and isinstance(checkpoint, dict)) else None
 
-    def forward(self, x):
-        emb = self.model(x, return_embedding=True)
-        return F.normalize(emb, p=2, dim=1)
+    def forward(self, x, return_raw: bool = False):
+        x = x.to(next(self.model.parameters()).device)
+        if not return_raw:
+            emb = self.model(x, return_embedding=True)
+            return F.normalize(emb, p=2, dim=1)
+        f1 = self.model.features[0](x)
+        f2 = self.model.features[1](f1)
+        f3 = self.model.features[2](f2)
+        f4 = self.model.features[3](f3)
+        emb = self.model.bn(self.model.fc(self.model.dropout(self.model.flatten(self.model.avgpool(f4)))))
+        out = F.normalize(emb, p=2, dim=1)
+        raw = torch.cat([
+            0.35 * _pool_stage(f2, 2),
+            0.55 * _pool_stage(f3, 2),
+            0.80 * _pool_stage(f4, 2),
+            1.00 * out,
+        ], dim=1)
+        return out, raw
 
     def predict_identity(self, x):
         """Vráti predikciu triedy a pravdepodobnosti, ak má model finetuned klasifikačnú hlavu."""
@@ -76,11 +107,31 @@ class FaceNetWrapper(FaceModelWrapper):
         self.model = InceptionResnetV1(pretrained=pretrained).to(device)
         self.model.eval()
 
-    def forward(self, x):
-        # facenet-pytorch vracia embeddingy, ale pre porovnávanie ich ešte
-        # L2 znormalizujeme, čo vylepšuje stabilitu kosínusovej podobnosti
-        emb = self.model(x)
-        return F.normalize(emb, p=2, dim=1)
+    def forward(self, x, return_raw: bool = False):
+        x = x.to(next(self.model.parameters()).device)
+        if not return_raw:
+            emb = self.model(x)
+            return F.normalize(emb, p=2, dim=1)
+        m = self.model
+        h = m.conv2d_1a(x)
+        h = m.conv2d_2a(h)
+        h = m.conv2d_2b(h)
+        h = m.maxpool_3a(h)
+        f1 = m.conv2d_3b(h)
+        h = m.conv2d_4a(f1)
+        h = m.conv2d_4b(h)
+        f2 = m.repeat_1(h)
+        f3 = m.repeat_2(m.mixed_6a(f2))
+        f4 = m.block8(m.repeat_3(m.mixed_7a(f3)))
+        emb = m.last_bn(m.last_linear(m.dropout(torch.flatten(m.avgpool_1a(f4), 1))))
+        out = F.normalize(emb, p=2, dim=1)
+        raw = torch.cat([
+            0.35 * _pool_stage(f2, 2),
+            0.55 * _pool_stage(f3, 2),
+            0.80 * _pool_stage(f4, 2),
+            1.00 * out,
+        ], dim=1)
+        return out, raw
 
 class ArcFaceWrapper(FaceModelWrapper):
     """
@@ -107,11 +158,26 @@ class ArcFaceWrapper(FaceModelWrapper):
         self.model = self.model.to(device)
         self.model.eval()
 
-    def forward(self, x):
-        # Zabezpečíme, že vstup je na rovnakom zariadení ako model
+    def forward(self, x, return_raw: bool = False):
         x = x.to(next(self.model.parameters()).device)
-        emb = self.model(x)
-        return F.normalize(emb, p=2, dim=1)
+        if not return_raw:
+            emb = self.model(x)
+            return F.normalize(emb, p=2, dim=1)
+        m = self.model
+        h = m.prelu(m.bn1(m.conv1(x)))
+        f1 = m.layer1(h)
+        f2 = m.layer2(f1)
+        f3 = m.layer3(f2)
+        f4 = m.layer4(f3)
+        emb = m.features(m.fc(m.dropout(torch.flatten(m.bn2(f4), 1))))
+        out = F.normalize(emb, p=2, dim=1)
+        raw = torch.cat([
+            0.35 * _pool_stage(f2, 2),
+            0.55 * _pool_stage(f3, 2),
+            0.80 * _pool_stage(f4, 2),
+            1.00 * out,
+        ], dim=1)
+        return out, raw
 
 class AdaFaceWrapper(FaceModelWrapper):
     """
@@ -142,12 +208,28 @@ class AdaFaceWrapper(FaceModelWrapper):
         except ImportError:
             print("⚠️ Upozornenie: Modul models.adaface_net nenájdený.")
 
-    def forward(self, x):
+    def forward(self, x, return_raw: bool = False):
         x = x.to(next(self.model.parameters()).device).contiguous()
-        emb = self.model(x)
-        if isinstance(emb, tuple):
-            emb = emb[0] 
-        return F.normalize(emb, p=2, dim=1)
+        if not return_raw:
+            emb = self.model(x)
+            if isinstance(emb, tuple):
+                emb = emb[0]
+            return F.normalize(emb, p=2, dim=1)
+        m = self.model
+        h = m.input_layer(x)
+        f1 = m.body[:3](h)
+        f2 = m.body[3:7](f1)
+        f3 = m.body[7:21](f2)
+        f4 = m.body[21:](f3)
+        emb_raw = m.output_layer(f4)
+        out = F.normalize(emb_raw, p=2, dim=1)
+        raw = torch.cat([
+            0.35 * _pool_stage(f2, 2),
+            0.55 * _pool_stage(f3, 2),
+            0.80 * _pool_stage(f4, 2),
+            1.00 * out,
+        ], dim=1)
+        return out, raw
 
 # Príklad použitia:
 if __name__ == "__main__":

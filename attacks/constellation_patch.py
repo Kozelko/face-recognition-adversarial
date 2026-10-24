@@ -59,9 +59,16 @@ def extract_landmarks(image_tensor: torch.Tensor, mtcnn=None, return_mesh: bool 
                 raw = res.face_landmarks[0]
                 pts_3d = [(float(p.x * 112.0), float(p.y * 112.0), float(p.z * 112.0)) for p in raw]
 
+                if len(pts_3d) > 473:
+                    l_eye = (pts_3d[468][0], pts_3d[468][1])
+                    r_eye = (pts_3d[473][0], pts_3d[473][1])
+                else:
+                    l_eye = ((pts_3d[33][0] + pts_3d[133][0]) * 0.5, (pts_3d[33][1] + pts_3d[133][1]) * 0.5)
+                    r_eye = ((pts_3d[263][0] + pts_3d[362][0]) * 0.5, (pts_3d[263][1] + pts_3d[362][1]) * 0.5)
+
                 lm5 = [
-                    (pts_3d[33][0], pts_3d[33][1]),
-                    (pts_3d[263][0], pts_3d[263][1]),
+                    l_eye,
+                    r_eye,
                     (pts_3d[1][0], pts_3d[1][1]),
                     (pts_3d[61][0], pts_3d[61][1]),
                     (pts_3d[291][0], pts_3d[291][1]),
@@ -161,7 +168,8 @@ def get_surface_geometry_at_coords(
     Vráti:
     (cos_slant, tilt_angle, depth_z)
     - cos_slant: pomer sploštenia elipsy (1.0 = kolmý pohľad, 0.45 = bočný sklon)
-    - tilt_angle: uhol natočenia elipsy v radiánoch (zarovnanie s kontúrou tváre)
+    - tilt_angle: smer KRATKEJ osi elipsy (smer, v ktorom sa povrch sklápa od kamery,
+      t.j. smer gradientu hĺbky). create_elliptical_patch_mask stláča os `angle_rad`.
     - depth_z: lokálna hĺbka pre tieňovanie
     """
     if pts_3d is None or len(pts_3d) < 10:
@@ -169,12 +177,21 @@ def get_surface_geometry_at_coords(
 
     pts = np.asarray(pts_3d, dtype=np.float32)
     dists_sq = (pts[:, 0] - qx) ** 2 + (pts[:, 1] - qy) ** 2
-    nearest_indices = np.argsort(dists_sq)[:6]
 
-    center_pt = pts[nearest_indices[0]]
-    diffs = pts[nearest_indices] - center_pt
-    A = diffs[:, :2]
-    b = diffs[:, 2]
+    # Rovina sa fituje cez body siete v okruhu ~11 px s Gaussovým váhovaním (sigma 4.5).
+    # Pri ťahaní nálepky sa tak sklon mení plynulo (meranie: zmena tvaru elipsy pri
+    # posune o 1 px 0.05 oproti 0.14 pri fite zo 6 najbližších bodov).
+    idx = np.nonzero(dists_sq < 11.0 ** 2)[0]
+    if len(idx) < 6:
+        idx = np.argsort(dists_sq)[:12]
+    w = np.exp(-dists_sq[idx] / (2.0 * 4.5 ** 2))
+    Q = pts[idx]
+    mu = (Q * w[:, None]).sum(axis=0) / w.sum()
+    D = Q - mu
+    sw = np.sqrt(w)
+    A = D[:, :2] * sw[:, None]
+    b = D[:, 2] * sw
+    center_pt = mu
     try:
         slope, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
         n = np.array([-slope[0], -slope[1], 1.0], dtype=np.float32)
@@ -190,8 +207,9 @@ def get_surface_geometry_at_coords(
         n = -n
 
     cos_slant = float(np.clip(n[2], 0.45, 1.0))
-    gradient_dir = math.atan2(float(n[1]), float(n[0]))
-    tilt_angle = gradient_dir + math.pi * 0.5
+    # Kruh v rovine s normálou n sa premietne na elipsu, ktorej krátka os leží v smere
+    # (n_x, n_y). Predtým tu bolo +90°, čo stláčalo nesprávnu os (oválne nálepky).
+    tilt_angle = math.atan2(float(n[1]), float(n[0]))
 
     return cos_slant, tilt_angle, float(center_pt[2])
 

@@ -233,13 +233,13 @@ def nasal_strip_attack(
     if mesh_info and "points_3d" in mesh_info and len(mesh_info["points_3d"]) > 197:
         pts = mesh_info["points_3d"]
         p195 = pts[195] if len(pts) > 195 else pts[197]
-        p197 = pts[197]
-        cx = float(p195[0])
-        cy = float(p195[1] * 0.70 + p197[1] * 0.30)
+        p5 = pts[5] if len(pts) > 5 else pts[195]
+        cx = float(p195[0] * 0.50 + p5[0] * 0.50)
+        cy = float(p195[1] * 0.50 + p5[1] * 0.50)
     else:
-        # 42 % vzdialenosti medzi očami a špičkou nosa = presne nosový mostík nad chlopňami
+        # 54 % vzdialenosti medzi očami a špičkou nosa = presne nosový mostík nad chlopňami
         cx = (lx + rx) * 0.5
-        cy = (ly + ry) * 0.5 + (ny - (ly + ry) * 0.5) * 0.42
+        cy = (ly + ry) * 0.5 + (ny - (ly + ry) * 0.5) * 0.54
 
     # Aplikácia manuálneho posunu od používateľa
     cx = float(np.clip(cx + offset_x, 10.0, 102.0))
@@ -248,8 +248,12 @@ def nasal_strip_attack(
     yaw = mesh_info.get("yaw", 0.0) if mesh_info else 0.0
 
     # Anatomické proporcie Breathe Right pásky:
-    # Šírka je cca 42-45 % vzdialenosti očí (cca 18-22 px, bezpečne pod kútikmi očí)
-    base_w = max(16.0, min(25.0, eye_dist * 0.45 * width_scale))
+    if mesh_info and "points_3d" in mesh_info and len(mesh_info["points_3d"]) > 278:
+        pts = mesh_info["points_3d"]
+        alar_w = math.hypot(pts[278][0] - pts[48][0], pts[278][1] - pts[48][1]) * 0.94
+        base_w = max(18.0, min(25.5, alar_w)) * float(width_scale)
+    else:
+        base_w = max(18.0, min(25.0, eye_dist * 0.52)) * float(width_scale)
     base_hc = base_w * 0.23   # ~5.2 px v strede chrbta nosa
     base_hw = base_w * 0.29   # ~6.8 px na bočných krídlach
 

@@ -10,9 +10,11 @@ env/
 venv/
 *.pyc
 
-# Project specific results
+# Project specific results and benchmark artifacts
 results/*.png
 results/*.csv
+results/*.json
+results/patch_eval/
 
 # Temporary Gradio files
 .gradio/
@@ -24,3 +26,13 @@ clanky/
 # IDE settings
 .vscode/
 .idea/
+
+# Generated printable patch sheets (artifacts, not source)
+printable_patches/
+
+# Internal development notes & agent artifacts
+.codewhale/
+AGENTS.md
+OBHAJOBA_A_TEORIA_PRIRUCKA.md
+PLAN_DP3.md
+RESULTS.md

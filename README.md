@@ -4,6 +4,7 @@ Tento repozitár obsahuje kompletnú platformu pre trénovanie, testovanie a vyh
 
 ## Obsah
 - [Architektúra projektu](#architektúra-projektu)
+- [Fyzické útoky a tlač vzorov](#fyzické-útoky-a-tlač-vzorov)
 - [Inštalácia](#inštalácia)
 - [Návod na použitie](#návod-na-použitie)
   - [1. Interaktívna GUI Platforma (Gradio)](#1-interaktívna-gui-platforma)
@@ -32,6 +33,42 @@ Súbory sa nachádzajú v zložke `attacks/`. Útoky sú optimalizované pre tv�
 - **BIM:** Základná iteračná metóda (Basic Iterative Method) - `bim.py`.
 - **MI-FGSM:** Iteračný útok s využitím momentovej stabilizácie gradientov - `mifgsm.py`.
 - **C&W (L2):** Špičkový optimalizačný útok (Carlini & Wagner) kalkulovaný v `arctanh` priestore pre minimalizáciu vizuálneho šumu - `cw.py`.
+
+**Fyzické (tlačiteľné) útoky** – simulujú reálny nosič (náplasť/nálepka) vytlačený na papieri a nalepený na tvár:
+- **Športová páska na nos (Breathe Right):** `nasal_strip_patch.py`, parametre `style` (čierna/karbón/telová), `width_scale`.
+- **Constellation Patch (Pimple Patches):** `constellation_patch.py`, vzory `trio_cheeks_nose`, `quad_full`, `cluster_5`, `asymmetric_random`, `star_patches`, `adversarial_freckles`; polohy viazané na 3D landmarky.
+- **Adversariálny leukoplast:** `adversarial_patch.py`, pozícia (`nose_bridge`, `cheek`, `forehead`) a veľkosť.
+- **Hybridný útok (páska + nálepky):** `hybrid_patch.py` – kombinuje nosovú pásku a hydrokoloidné nálepky. Obsahuje fyzikálnu EoT pipeline (perspektívna homografia, kamerová/JPEG simulácia, osvetlenie pokožky), vysokorozlíšené textúry (96×256 / 96×96), režim obmedzenej palety/logo (`palette=`, `logo_mask=`), kompenzáciu sklonu povrchu a generovanie tlačového A4 hárku (`generate_printable_sheet`, mierka 1:1 z IPD).
+- **Ensemble hybrid (Téza D):** `ensemble_hybrid_patch.py` – hybridný útok súčasne na viac modelov s voľbou agregácie gradientov (`grad_avg`), MI-FGSM momentum, DI-FGSM input diversity a feature-space stratou (`feature_weight`), plus voliteľný PAD hook (`pad_model`).
+
+### Detekcia živosti (PAD)
+- **MiniFASNetV2:** `models/pad_minifasnet.py` (+ `models/minifasnet_arch.py`) – prezentuje `live` pravdepodobnosť (`load_pad_model()`), slúži na overenie, či tlačený nosič obíde liveness detektor. `forward` je diferencovateľný voči vstupu (váhy zmrazené), takže sa dá použiť ako penalizácia v útoku.
+
+---
+
+## Fyzické útoky a tlač vzorov
+
+Tlačiteľné útoky sa dajú spustiť dvoma spôsobmi:
+
+1. **Interaktívne v Gradio appke** (`python app.py`): v Záložke 1 vyber typ útoku (Hybrid, Constellation, Športová páska, Leukoplast), nastav polohu myšou (drag & drop) aj jemným posuvníkom, zvoľ rádius/iterácie a stlač **Spustiť útok**. Vpravo sa zobrazí tvár po útoku a **tlačový hárok A4 (100 % mierka)**.
+2. **Dávkovo:** `python run_patch_experiments.py --series 3,4,T` spustí SÉRIU 3 (hybrid na jednotlivých modeloch), SÉRIU 4 (ensemble) a transfer maticu; výstupy sú v `results/patch_eval/` a `results/transfer_matrix.csv`.
+
+**Tlač vzorov (A4 hárok):**
+- Hárok sa generuje v presnej mierke **1:1 (100 %)**; over ju pravitkom podľa kalibračného meradla 50 mm na hárku.
+- Mierka mm/px sa odvodí z interpupilárnej vzdialenosti (IPD ≈ 63 mm) tváre z fotky.
+- **Nálepky sú na hárku nakreslené ako rovné kruhy** (perspektívne skrátenie sa kompenzuje), aby sa dali vystrihnúť a nalepiť; obrys (alpha) zodpovedá skutočnému tvaru nálepky.
+- Tlač na matný samolepiaci papier, profil farieb sRGB, **bez** škálovania „Fit to page“.
+- Exportovaný hárok sa vždy uloží aj do `printable_patches/printable_patch_sheet_last.png`.
+
+**Kalibrácia prahu a hromadná evaluácia:**
+```bash
+# per-model cosine threshold @ FAR=1e-3 (používá LFW páry, fallback na CASIA)
+python evaluate_batched.py --calibrate
+# hromadná evaluácia digitálnych útokov (2000 snímok) -> results/batched_evaluation.csv
+python evaluate_batched.py
+# hybrid patch evaluácia (per-image) -> pripíše do results/batched_evaluation.csv
+python evaluate_batched.py --hybrid --hybrid-n 100 --hybrid-iters 40
+```
 
 ---
 
@@ -117,14 +154,26 @@ face-recognition-adversarial/
 │   ├── pgd.py
 │   ├── bim.py
 │   ├── mifgsm.py
-│   └── cw.py                  # Carlini & Wagner optimalizovaný pre embeddingy
+│   ├── cw.py                  # Carlini & Wagner optimalizovaný pre embeddingy
+│   ├── nasal_strip_patch.py   # Športová páska na nos (Breathe Right)
+│   ├── constellation_patch.py # Konštelácia mikro-nálepiek + 3D geometria povrchu
+│   ├── adversarial_patch.py   # Adversariálny leukoplast
+│   ├── hybrid_patch.py        # Hybridný útok (páska + nálepky), EoT, tlačový hárok
+│   └── ensemble_hybrid_patch.py  # Ensemble + gradient averaging + PAD hook
 │
 ├── models/                    # Architektúry sietí a wrappery
 │   ├── benchmark_cnn.py       # Baseline Vlastný model
 │   ├── iresnet.py             # SOTA architektúra (pre ArcFace)
 │   ├── adaface_net.py         # SOTA architektúra (pre AdaFace)
+│   ├── minifasnet_arch.py     # Architektúra PAD detektora
+│   ├── pad_minifasnet.py      # MiniFASNetV2 liveness (PAD)
 │   ├── wrappers.py            # Zjednotené rozhranie pre modely (FaceModelWrapper)
 │   └── checkpoints/           # Predtrénované váhy modelov (.pth)
+│
+├── run_patch_experiments.py   # Fyzické útoky: SÉRIA 1-4 + transfer matica (--series)
+├── run_heldout_experiment.py  # Held-out transfer protokol (train 3 modely, test 4.)
+├── run_universal_patch.py     # Univerzálny patch cez viac identít
+├── run_physical_sweep.py      # Široký sweep fyzických útokov a parametrov
 │
 ├── utils/
 │   ├── preprocess.py          # Skript na hromadné MTCNN spracovanie
