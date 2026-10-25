@@ -62,10 +62,13 @@ def _illumination_gain(image: torch.Tensor) -> torch.Tensor:
     wts = wts / wts.sum()
     blurred = F.conv2d(F.pad(lum01, (k // 2, k // 2, 0, 0), mode="replicate"), wts.view(1, 1, 1, k))
     blurred = F.conv2d(F.pad(blurred, (0, 0, k // 2, k // 2), mode="replicate"), wts.view(1, 1, k, 1))
-    mean_lum = blurred.mean(dim=(-2, -1), keepdim=True).clamp_min(0.15)
+    h, w = blurred.shape[-2], blurred.shape[-1]
+    y0, y1 = int(h * 0.22), int(h * 0.68)
+    x0, x1 = int(w * 0.22), int(w * 0.78)
+    mean_lum = blurred[:, :, y0:y1, x0:x1].mean(dim=(-2, -1), keepdim=True).clamp_min(0.22)
     rel_illum = blurred / mean_lum
-    ambient_factor = torch.clamp(mean_lum / 0.52, 0.45, 1.05)
-    return torch.clamp(rel_illum * ambient_factor * 0.94, 0.25, 1.15)
+    ambient_factor = torch.clamp(mean_lum / 0.48, 0.72, 1.08)
+    return torch.clamp(rel_illum * ambient_factor * 0.96, 0.55, 1.15)
 
 
 def _region_field(field: torch.Tensor, box: tuple[int, int, int, int], tex_h: int, tex_w: int, pad: int = 2) -> torch.Tensor:
@@ -378,26 +381,18 @@ def get_hybrid_geometry(
     strip_cy = float(np.clip(strip_cy + offset_y + strip_oy, 10.0, 102.0))
 
     if has_mesh and len(pts) > 278:
-        alar_w = math.hypot(pts[278][0] - pts[48][0], pts[278][1] - pts[48][1]) * 0.94
-        base_w = max(18.0, min(25.5, alar_w))
+        alar_w = math.hypot(pts[278][0] - pts[48][0], pts[278][1] - pts[48][1]) * 0.89
+        base_w = max(17.8, min(23.6, alar_w))
     else:
-        base_w = max(18.0, min(25.0, eye_dist * 0.52))
+        base_w = max(17.8, min(23.6, eye_dist * 0.48))
     base_w = base_w * float(strip_w_scale)
 
-    if has_mesh and len(pts) > 168:
-        p_bridge = pts[168] if len(pts) > 168 else pts[6]
-        p_tip = pts[1] if len(pts) > 1 else pts[4]
-        nv_x = p_tip[0] - p_bridge[0]
-        nv_y = p_tip[1] - p_bridge[1]
-        if abs(nv_x) + abs(nv_y) > 1e-4:
-            strip_angle = math.atan2(nv_y, nv_x) - math.pi * 0.5
-        else:
-            strip_angle = roll
-    else:
-        strip_angle = roll
+    # Uhol nosnej pásky sa viaže na skutočný náklon hlavy v rovine obrazu (roll z očí),
+    # aby 3D perspektíva špičky nosa (yaw) nespôsobovala umelé zošikmenie pásky.
+    strip_angle = roll
 
-    base_hc = base_w * 0.23
-    base_hw = base_w * 0.29
+    base_hc = base_w * 0.255
+    base_hw = base_w * 0.33
 
     strip_mask, strip_relief, strip_shadow, strip_sheen = create_nasal_strip_mask(
         img_size=img_size,
@@ -408,12 +403,25 @@ def get_hybrid_geometry(
         angle_rad=strip_angle,
         yaw=yaw,
         feather=0.70,
+        arch_factor=0.34,
+    )
+    strip_flat_mask, _, _, _ = create_nasal_strip_mask(
+        img_size=img_size,
+        center=(strip_cy, strip_cx),
+        width=base_w,
+        height_center=base_hc,
+        height_wings=base_hw,
+        angle_rad=strip_angle,
+        yaw=yaw,
+        feather=0.70,
+        arch_factor=0.0,
     )
     strip_mask = strip_mask.to(device)
+    strip_flat_mask = strip_flat_mask.to(device)
     strip_relief = strip_relief.to(device)
 
     scy_i, scx_i = int(round(strip_cy)), int(round(strip_cx))
-    s_pad_h = int(math.ceil(base_hw * 0.5)) + 3
+    s_pad_h = int(math.ceil(base_hw * 0.65)) + 3
     s_pad_w = int(math.ceil(base_w * 0.5)) + 3
     sy1, sy2 = max(0, scy_i - s_pad_h), min(img_size, scy_i + s_pad_h)
     sx1, sx2 = max(0, scx_i - s_pad_w), min(img_size, scx_i + s_pad_w)
@@ -421,18 +429,21 @@ def get_hybrid_geometry(
     boxes = {
         "strip": (sy1, sy2, sx1, sx2),
         "strip_angle": float(strip_angle),
+        "strip_flat_mask": strip_flat_mask,
     }
 
     # Nálepky na lícach
     r_dot = max(2.0, min(14.0, float(dot_radius)))
 
-    # Ľavé líce (stred malárnej oblasti, bezpečne mimo nosovej pásky)
+    # Ľavé líce (stred malárnej oblasti, bezpečne mimo nosa, očí aj brady)
     if has_mesh and len(pts) > 205:
         p_l = pts[205]
-        lcx, lcy = float(p_l[0]), float(p_l[1]) - 1.5
+        p_l_in = pts[101] if len(pts) > 101 else p_l
+        lcx = float(0.72 * p_l[0] + 0.28 * p_l_in[0])
+        lcy = float(0.72 * p_l[1] + 0.28 * p_l_in[1]) - 1.0
     else:
         lcx = lx - (nx - lx) * 0.12
-        lcy = ly + (mly - ly) * 0.45
+        lcy = ly + (mly - ly) * 0.44
 
     lcx = float(np.clip(lcx + offset_x + left_ox, 6.0, 106.0))
     lcy = float(np.clip(lcy + offset_y + left_oy, 6.0, 106.0))
@@ -465,14 +476,16 @@ def get_hybrid_geometry(
     full_relief = torch.where(strip_mask > 0.1, strip_relief, full_relief)
     full_relief = torch.where(l_mask > 0.1, l_relief, full_relief)
 
-    # Pravé líce (stred malárnej oblasti, bezpečne mimo nosovej pásky)
+    # Pravé líce (stred malárnej oblasti, bezpečne mimo nosa, očí aj brady)
     if "1_cheek" not in dot_pattern and "1 nálepka" not in dot_pattern:
         if has_mesh and len(pts) > 425:
             p_r = pts[425]
-            rcx, rcy = float(p_r[0]), float(p_r[1]) - 1.5
+            p_r_in = pts[330] if len(pts) > 330 else p_r
+            rcx = float(0.72 * p_r[0] + 0.28 * p_r_in[0])
+            rcy = float(0.72 * p_r[1] + 0.28 * p_r_in[1]) - 1.0
         else:
             rcx = rx + (rx - nx) * 0.12
-            rcy = ry + (mry - ry) * 0.45
+            rcy = ry + (mry - ry) * 0.44
 
         rcx = float(np.clip(rcx + offset_x + right_ox, 6.0, 106.0))
         rcy = float(np.clip(rcy + offset_y + right_oy, 6.0, 106.0))
@@ -602,8 +615,8 @@ def generate_printable_sheet(
         perspektívne skrátenie."""
         img_size = 112
         y1, y2, x1, x2 = flat["box"]
-        py1, py2 = max(0, y1 - 2), min(img_size, y2 + 2)
-        px1, px2 = max(0, x1 - 2), min(img_size, x2 + 2)
+        py1, py2 = max(0, y1), min(img_size, y2)
+        px1, px2 = max(0, x1), min(img_size, x2)
         ch, cw = py2 - py1, px2 - px1
         th_, tw_ = rgb_tex.shape[0], rgb_tex.shape[1]
         r_img = float(flat["r"])
@@ -670,7 +683,9 @@ def generate_printable_sheet(
         mm_h = float(geo.get("mm_h", rgb.shape[0] * mm_per_px))
         tw = max(2, int(round(mm_w * MM_TO_PX)))
         th = max(2, int(round(mm_h * MM_TO_PX)))
-        rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+        rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_CUBIC)
+        # Jemné vyhladenie hrán makro-kociek pre prirodzený tlačový vzhľad textílie:
+        rgb = cv2.bilateralFilter(rgb, d=7, sigmaColor=35, sigmaSpace=7)
         alpha = cv2.resize(alpha, (tw, th), interpolation=cv2.INTER_LANCZOS4)
 
         # Aplikácia strip_angle na finálny renderovaný vzor na hárku
@@ -685,6 +700,19 @@ def generate_printable_sheet(
             rot = cv2.warpAffine(pad, rm, (diag, diag), flags=cv2.INTER_LANCZOS4,
                                  borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
             rgb, alpha = rot[:, :, :3], rot[:, :, 3]
+
+        # Orezanie prázdneho priehľadného okraja boxu a výpočet skutočného rozmeru masky v mm
+        ys_nz, xs_nz = np.nonzero(alpha > 16)
+        if len(ys_nz) > 0 and len(xs_nz) > 0:
+            ay1 = max(0, int(ys_nz.min()) - 2)
+            ay2 = min(alpha.shape[0], int(ys_nz.max()) + 3)
+            ax1 = max(0, int(xs_nz.min()) - 2)
+            ax2 = min(alpha.shape[1], int(xs_nz.max()) + 3)
+            mm_w = float((int(xs_nz.max()) - int(xs_nz.min()) + 1) / MM_TO_PX)
+            mm_h = float((int(ys_nz.max()) - int(ys_nz.min()) + 1) / MM_TO_PX)
+            rgb = rgb[ay1:ay2, ax1:ax2]
+            alpha = alpha[ay1:ay2, ax1:ax2]
+
         return {
             "key": key,
             "rgb": np.ascontiguousarray(rgb),
@@ -760,6 +788,21 @@ def generate_printable_sheet(
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 130, 0), 1, cv2.LINE_AA)
 
             _paste(it["rgb"], it["alpha"], x_cursor, y0_px)
+
+            # Presná strihacia línia (tenký sivý obrys pre nožnice po celom obvode nálepky)
+            if "strip" in it["key"]:
+                cnts_a, _ = cv2.findContours((it["alpha"] > 32).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
+                if cnts_a:
+                    c_main = max(cnts_a, key=cv2.contourArea)
+                    poly = cv2.approxPolyDP(c_main, 0.003 * cv2.arcLength(c_main, True), True)
+                    poly_shifted = poly + np.array([x_cursor, y0_px])
+                    cv2.polylines(sheet, [poly_shifted], True, (80, 80, 80), 2, cv2.LINE_AA)
+            else:
+                rad = min(h_i, w_i) // 2
+                cy_dot = y0_px + h_i // 2
+                cx_dot = x_cursor + w_i // 2
+                cv2.circle(sheet, (cx_dot, cy_dot), rad, (80, 80, 80), 2, cv2.LINE_AA)
+
             tag_str = short_tags.get(it["key"], it["label"])
             dim_str = f"({it['mm_w']:.1f} x {it['mm_h']:.1f} mm)"
             cv2.putText(sheet, tag_str, (x_cursor, y0_px + h_i + 24),
@@ -833,12 +876,15 @@ def build_printable_payload(boxes: dict, spec_items: dict, mm_per_px: float):
     masks_np, geo = {}, {}
     for key, (box, tex_size) in spec_items.items():
         y1, y2, x1, x2 = box
-        m = boxes.get(mask_keys.get(key))
+        if key == "strip" and "strip_flat_mask" in boxes:
+            m = boxes["strip_flat_mask"]
+        else:
+            m = boxes.get(mask_keys.get(key))
         if m is not None:
-            masks_np[key] = _region_field(m, box, tex_size[0], tex_size[1]).squeeze().cpu().numpy()
+            masks_np[key] = _region_field(m, box, tex_size[0], tex_size[1], pad=0).squeeze().cpu().numpy()
         if key == "strip":
-            geo[key] = {"mm_w": (x2 - x1) * mm_per_px, "mm_h": (y2 - y1) * mm_per_px,
-                        "unsquash": 1.0, "rotate_deg": -math.degrees(strip_angle),
+            geo[key] = {"mm_w": (x2 - x1) * mm_per_px * 1.14, "mm_h": (y2 - y1) * mm_per_px,
+                        "unsquash": 1.14, "rotate_deg": -math.degrees(strip_angle),
                         "label": labels[key]}
         else:
             geo[key] = {"mm_w": 2.0 * r_dot_eff * mm_per_px, "mm_h": 2.0 * r_dot_eff * mm_per_px,

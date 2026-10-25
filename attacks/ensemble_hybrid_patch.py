@@ -89,8 +89,8 @@ DEFAULT_ARCH_PRIORS = {
 
 DEFAULT_MARGIN_LOW = 0.30   # konzervatívna hranica; kalibruj cez margin_low dict
 
-# Priehľadnosť materiálu (0.88 zabezpečuje fotometrické zladenie s teplom a šumom kamery).
-PATCH_BLEND_FACTOR = 0.88
+# Priehľadnosť materiálu (0.93 zabezpečuje plný kontrast matného papiera pri zachovaní fotometrie).
+PATCH_BLEND_FACTOR = 0.93
 
 
 def _anchors_tensor(device):
@@ -313,6 +313,8 @@ def ensemble_hybrid_patch_attack(
     offset_y: float = 0.0,
     palette: list | None = None,
     logo_mask: torch.Tensor | None = None,
+    gallery_centroids: dict[str, torch.Tensor] | None = None,
+    arch_priors: dict[str, float] | None = None,
 ) -> tuple:
     """
     BioMesh-SpecPatch: Ensemblový 3D-geometrický frekvenčne-ukotvený hybridný útok (Téza D).
@@ -424,9 +426,32 @@ def ensemble_hybrid_patch_attack(
                 c_up = F.interpolate(params[f"{key}_coarse"], size=(th, tw), mode="bicubic", align_corners=False)
                 m_up = F.interpolate(params[f"{key}_mid"], size=(th, tw), mode="bicubic", align_corners=False)
                 f_up = params[f"{key}_fine"]
-                raw = init + 0.65 * c_up + 0.35 * m_up + 0.20 * f_up
+                delta = 0.72 * c_up + 0.58 * m_up + 0.42 * f_up
             else:
-                raw = init + params[key]
+                delta = params[key]
+
+            if not is_rgb:
+                delta_lum = delta.mean(dim=1, keepdim=True)
+                delta_chr = (delta - delta_lum).clamp(-0.45, 0.45)
+                delta_wb = (delta[:, 0:1] - delta[:, 2:3]).clamp(-0.65, 0.65)
+                v_wb = torch.tensor([1.0, 0.35, -0.85], device=device).view(1, 3, 1, 1)
+                if strip_style == "tan_fabric":
+                    c_tan = torch.tensor([0.24, 0.08, -0.06], device=device).view(1, 3, 1, 1)
+                    s_tan = torch.tensor([0.92, 0.84, 0.76], device=device).view(1, 3, 1, 1)
+                    raw = c_tan + delta_lum * s_tan + delta_wb * v_wb * 0.38 + delta_chr * 0.30
+                elif strip_style in ["clear_silicone", "clear"]:
+                    raw = init + delta_lum * 0.90 + delta_wb * v_wb * 0.25 + delta_chr * 0.25
+                else:
+                    if key == "strip":
+                        c_blk = torch.tensor([-0.24, -0.24, -0.22], device=device).view(1, 3, 1, 1)
+                        raw = c_blk + delta_lum * 0.96 + delta_wb * v_wb * 0.30 + delta_chr * 0.25
+                    else:
+                        c_dot = torch.tensor([0.16, 0.04, -0.06], device=device).view(1, 3, 1, 1)
+                        s_dot = torch.tensor([0.92, 0.86, 0.78], device=device).view(1, 3, 1, 1)
+                        raw = c_dot + delta_lum * s_dot + delta_wb * v_wb * 0.36 + delta_chr * 0.30
+            else:
+                raw = init + delta
+
             raw = torch.clamp(raw, -1.0, 1.0)
             raw = _prep_tex(raw, key)
             out[key] = raw
@@ -467,7 +492,7 @@ def ensemble_hybrid_patch_attack(
             if g is None:
                 flats.append(torch.zeros(p.numel(), device=device))
             else:
-                g_proc = _ti_smooth_grad(g, ti_kernel) if smooth else g
+                g_proc = _ti_smooth_grad(g, ti_kernel) if (smooth and g.shape[-1] >= 32) else g
                 if norm_per_tensor:
                     t_rms = g_proc.pow(2).mean().sqrt().clamp_min(1e-8)
                     g_proc = g_proc / t_rms
@@ -481,14 +506,17 @@ def ensemble_hybrid_patch_attack(
     eot_k = max(3, EOT_BATCH // batch_photos)
 
     # --- Optimalizácia ---
+    best_score = float("inf")
+    best_params = None
+
     for it in range(num_iter):
         opt.zero_grad()
 
         if len(geo) == 1:
             selected_indices = [0]
         else:
-            perm = torch.randperm(len(geo))[:batch_photos].tolist()
-            selected_indices = perm
+            aux_perm = [i + 1 for i in torch.randperm(len(geo) - 1)[:max(1, batch_photos - 1)].tolist()]
+            selected_indices = [0] + aux_perm
 
         patches = _current_patches()
 
@@ -531,13 +559,20 @@ def ensemble_hybrid_patch_attack(
 
         def _model_loss(name, m):
             total_m = torch.zeros((), device=device)
-            sim_accum = 0.0
+            sim_primary = None
+            sim_aux_list = []
+            n_aux = max(1, len(step_batches) - 1)
             for idx, model_input, base_warps, clean_input in step_batches:
+                pose_w = 1.0 if len(step_batches) == 1 else (0.68 if idx == 0 else (0.32 / n_aux))
                 if name in targets and targets[name] is not None:
                     s_i = 0.5 * F.cosine_similarity(targets[name], m(model_input)).mean() \
                           + 0.5 * F.cosine_similarity(targets[name], m(clean_input)).mean()
-                    total_m = total_m - s_i
-                    sim_accum += float(-s_i.detach().item())
+                    total_m = total_m - pose_w * s_i
+                    val_s = float(-s_i.detach().item())
+                    if idx == 0:
+                        sim_primary = val_s
+                    else:
+                        sim_aux_list.append(val_s)
                     continue
 
                 if feature_weight > 0.0:
@@ -563,10 +598,21 @@ def ensemble_hybrid_patch_attack(
                     sim_eot = F.cosine_similarity(orig_emb, adv_emb).mean()
 
                 sim_clean = F.cosine_similarity(orig_emb, clean_emb).mean()
-                sim = 0.55 * sim_eot + 0.45 * sim_clean
-                sim_accum += float(sim.detach().item())
-                # Plynulý tlak nadol aj pod margin[name], so zvýšenou váhou nad marginom
-                l_i = sim + 0.5 * F.relu(sim - margin[name])
+                sim = 0.35 * sim_eot + 0.65 * sim_clean
+                if gallery_centroids and name in gallery_centroids and gallery_centroids[name] is not None:
+                    g_emb = gallery_centroids[name]
+                    sim_g_eot = F.cosine_similarity(g_emb, adv_emb).mean()
+                    sim_g_clean = F.cosine_similarity(g_emb, clean_emb).mean()
+                    sim_g = 0.35 * sim_g_eot + 0.65 * sim_g_clean
+                    sim = 0.45 * sim + 0.55 * sim_g + 1.8 * F.relu(sim_g_clean - 0.42)
+                    val_s = float(sim_g_clean.detach().item())
+                else:
+                    val_s = float(sim_clean.detach().item())
+                if idx == 0:
+                    sim_primary = val_s
+                else:
+                    sim_aux_list.append(val_s)
+                l_i = sim + 1.6 * F.relu(sim_clean - 0.44) + 0.8 * F.relu(sim - margin[name])
 
                 if feature_weight > 0.0 and adv_raw is not None:
                     feat_eot = F.cosine_similarity(base_raw, adv_raw, dim=1).mean()
@@ -574,33 +620,43 @@ def ensemble_hybrid_patch_attack(
                     feat_sim = 0.55 * feat_eot + 0.45 * feat_clean
                     l_i = l_i + feature_weight * feat_sim
 
-                total_m = total_m + l_i
-            n_b = max(1, len(step_batches))
-            return total_m / n_b, sim_accum / n_b
+                total_m = total_m + pose_w * l_i
+            if sim_primary is None:
+                sim_out = sum(sim_aux_list) / max(1, len(sim_aux_list))
+            elif sim_aux_list:
+                sim_out = 0.82 * sim_primary + 0.18 * (sum(sim_aux_list) / len(sim_aux_list))
+            else:
+                sim_out = sim_primary
+            return total_m, sim_out
+
+        active_priors = arch_priors if arch_priors is not None else DEFAULT_ARCH_PRIORS
 
         if use_ga:
             model_grads = []
+            cur_sims = []
             for name, m in models.items():
                 m_loss, m_sim = _model_loss(name, m)
+                cur_sims.append(m_sim)
                 g = torch.autograd.grad(m_loss, param_list,
                                         retain_graph=True, allow_unused=True)
                 flat = _flat_grads(g, smooth=True)
                 rms = flat.pow(2).mean().sqrt().clamp_min(1e-8)
-                # Adaptívne váhovanie obtiažnosti (Hardness-Aware Gradient Alignment)
-                # v kombinácii s apriórnou trhovou váhou (Margin modely tvoria ~85% praxe):
                 hardness_w = (max(0.10, m_sim) ** 2.2) * (2.2 if m_sim > 0.40 else 0.4)
-                arch_w = DEFAULT_ARCH_PRIORS.get(name, 1.0)
+                arch_w = active_priors.get(name, 1.0)
                 model_grads.append((flat / rms) * (hardness_w * arch_w))
+            if cur_sims:
+                over_50 = sum(max(0.0, s - 0.492) * 8.0 for s in cur_sims)
+                sc = over_50 + (sum(cur_sims) / len(cur_sims))
+                if sc < best_score:
+                    best_score = sc
+                    best_params = {k: v.detach().clone() for k, v in params.items()}
             direction = torch.stack(model_grads).sum(0)
             dir_rms = direction.pow(2).mean().sqrt().clamp_min(1e-8)
             direction = direction / dir_rms
 
             aux = reg_total if pad_term is None else reg_total + pad_term
-            g_aux = _flat_grads(torch.autograd.grad(aux, param_list, allow_unused=True), smooth=False, norm_per_tensor=False)
-            aux_rms = g_aux.pow(2).mean().sqrt().clamp_min(1e-8)
-            if aux_rms > 0.08:
-                g_aux = g_aux * (0.08 / aux_rms)
-            direction = direction + g_aux
+            g_aux = _flat_grads(torch.autograd.grad(aux, param_list, allow_unused=True), smooth=False, norm_per_tensor=True)
+            direction = direction + 0.05 * g_aux
 
             if mom_flat is not None:
                 d_norm = direction / direction.pow(2).mean().sqrt().clamp_min(1e-8)
@@ -617,7 +673,7 @@ def ensemble_hybrid_patch_attack(
 
             if update_rule == "sign":
                 cos_decay = 0.5 * (1.0 + math.cos(math.pi * it / max(1, num_iter)))
-                step_sz = lr * (0.15 + 0.45 * cos_decay)
+                step_sz = lr * (0.35 + 0.65 * cos_decay)
                 with torch.no_grad():
                     for p in param_list:
                         p.add_(-step_sz * p.grad.sign())
@@ -626,9 +682,18 @@ def ensemble_hybrid_patch_attack(
                 opt.step()
         else:
             loss = torch.zeros((), device=device)
+            cur_sims = []
             for name, m in models.items():
-                m_loss, _ = _model_loss(name, m)
-                loss = loss + m_loss
+                m_loss, m_sim = _model_loss(name, m)
+                cur_sims.append(m_sim)
+                w_m = active_priors.get(name, 1.0) * (1.0 + 3.5 * max(0.0, m_sim - 0.42))
+                loss = loss + w_m * m_loss
+            if cur_sims:
+                over_50 = sum(max(0.0, s - 0.492) * 8.0 for s in cur_sims)
+                sc = over_50 + (sum(cur_sims) / len(cur_sims))
+                if sc < best_score:
+                    best_score = sc
+                    best_params = {k: v.detach().clone() for k, v in params.items()}
 
             total = loss + reg_total
             if pad_term is not None:
@@ -637,7 +702,7 @@ def ensemble_hybrid_patch_attack(
             total.backward()
             with torch.no_grad():
                 for p in param_list:
-                    if p.grad is not None:
+                    if p.grad is not None and p.shape[-1] >= 32:
                         p.grad.copy_(_ti_smooth_grad(p.grad, ti_kernel))
             opt.step()
 
@@ -647,6 +712,9 @@ def ensemble_hybrid_patch_attack(
 
     # --- Finálna kompozícia (bez EOT) ---
     with torch.no_grad():
+        if best_params is not None:
+            for k, v in best_params.items():
+                params[k].copy_(v)
         base, full_mask, full_relief, boxes, lm = geo[0]
         patches = _current_patches()
         gain_full = _illumination_gain(base)

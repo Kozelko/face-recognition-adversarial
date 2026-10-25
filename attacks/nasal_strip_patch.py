@@ -27,6 +27,7 @@ def create_nasal_strip_mask(
     angle_rad: float,
     yaw: float = 0.0,
     feather: float = 0.70,
+    arch_factor: float = 0.34,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Vytvorí presnú 3D masku, reliéf vzpruh, valcové tieňovanie a kontaktný tieň pre Breathe Right pásku.
@@ -44,43 +45,60 @@ def create_nasal_strip_mask(
     yr_raw = -x * sin_a + y * cos_a
 
     half_w = max(5.0, width * 0.5)
+    if abs(yaw) > 0.05 and arch_factor > 0.0:
+        sin_y = math.sin(yaw)
+        cos_y = math.cos(yaw)
+        far_scale = max(0.38, cos_y - 0.42 * abs(sin_y))
+        near_scale = min(1.16, cos_y + 0.25 * abs(sin_y))
+        right_scale = far_scale if sin_y > 0 else near_scale
+        left_scale = near_scale if sin_y > 0 else far_scale
+        half_w_local = torch.where(xr >= 0, half_w * right_scale, half_w * left_scale)
+    else:
+        half_w_local = torch.full_like(xr, half_w)
 
-    u = xr / half_w
+    u = xr / half_w_local
     u_c = torch.clamp(torch.abs(u), 0.0, 1.15)
 
-    # Jemné motýlie rozšírenie krídeliek na bokoch nosa:
-    local_half_h = 0.5 * (height_center + (height_wings - height_center) * torch.pow(torch.clamp(u_c, 0.0, 1.0), 1.6))
+    # 3D anatomické klenutie (oblúk ∩) cez vysoký chrbát nosa:
+    # Stred pásky sedí vyššie na hrebeni nosa a krídelká na bokoch klesajú
+    # dolu po strmých bočných stenách nosa smerom k nosovým krídlam.
+    arch_drop = float(arch_factor) * height_wings if arch_factor > 0.0 else 0.0
+    yr_arch = yr_raw - arch_drop * (torch.pow(torch.clamp(u_c, 0.0, 1.05), 1.85) - 0.28)
 
-    # Signed Distance Field (SDF) pre motýlí tvar so zaoblenými koncami
-    corner_r = 1.6
-    dx = torch.clamp(torch.abs(xr) - (half_w - corner_r), min=0.0)
-    dy = torch.clamp(torch.abs(yr_raw) - (local_half_h - corner_r), min=0.0)
+    # Jemné motýlie rozšírenie krídeliek na bokoch nosa:
+    local_half_h = 0.5 * (height_center + (height_wings - height_center) * torch.pow(torch.clamp(u_c, 0.0, 1.0), 1.5))
+
+    # Signed Distance Field (SDF) pre 3D klenutý motýlí tvar so zaoblenými koncami
+    corner_r = 1.7
+    dx = torch.clamp(torch.abs(xr) - (half_w_local - corner_r), min=0.0)
+    dy = torch.clamp(torch.abs(yr_arch) - (local_half_h - corner_r), min=0.0)
     corner_dist = torch.sqrt(dx**2 + dy**2)
 
-    in_strip_dist = torch.where(torch.abs(xr) <= half_w - corner_r, torch.abs(yr_raw) - local_half_h, corner_dist - corner_r)
+    in_strip_dist = torch.where(torch.abs(xr) <= half_w_local - corner_r, torch.abs(yr_arch) - local_half_h, corner_dist - corner_r)
     mask = torch.clamp(0.5 - in_strip_dist / max(0.4, feather), 0.0, 1.0).view(1, 1, img_size, img_size)
 
-    shading_lateral = torch.clamp(1.0 - 0.22 * (u_c ** 2), 0.78, 1.05)
+    # Výraznejšie valcové stmavenie na strmých bočných stenách nosa (3D hĺbka Z)
+    shading_lateral = torch.clamp(1.03 - 0.30 * (u_c ** 2), 0.72, 1.05)
     if yaw != 0.0:
         shading_lateral = shading_lateral * (1.0 + 0.15 * math.sin(yaw) * torch.clamp(u, -1.0, 1.0))
     shading = shading_lateral.view(1, 1, img_size, img_size)
 
     rail_offset = max(1.0, height_center * 0.26)
-    rail1 = torch.exp(-((yr_raw - rail_offset) ** 2) / 0.75)
-    rail2 = torch.exp(-((yr_raw + rail_offset) ** 2) / 0.75)
+    rail1 = torch.exp(-((yr_arch - rail_offset) ** 2) / 0.75)
+    rail2 = torch.exp(-((yr_arch + rail_offset) ** 2) / 0.75)
     rails = ((rail1 + rail2) * 0.09).view(1, 1, img_size, img_size)
 
     surface_relief = shading + rails
 
-    # Kontaktný tieň a odlesk
-    shadow_yr = yr_raw - 0.75
+    # Kontaktný tieň a odlesk kopírujúci 3D oblúk nosa
+    shadow_yr = yr_arch - 0.75
     dy_s = torch.clamp(torch.abs(shadow_yr) - (local_half_h - corner_r), min=0.0)
     shadow_dist = torch.where(torch.abs(xr) <= half_w - corner_r, torch.abs(shadow_yr) - local_half_h, torch.sqrt(dx**2 + dy_s**2) - corner_r)
     shadow_raw = torch.clamp(0.5 - shadow_dist / 0.9, 0.0, 1.0).view(1, 1, img_size, img_size)
     drop_shadow = (torch.clamp(shadow_raw - mask, 0.0, 1.0) * 0.32).view(1, 1, img_size, img_size)
 
-    spec_yr = yr_raw + local_half_h * 0.60
-    specular_sheen = (torch.clamp(1.0 - torch.abs(spec_yr) / 0.9, 0.0, 1.0) ** 2 * mask * 0.10).view(1, 1, img_size, img_size)
+    spec_yr = yr_arch + local_half_h * 0.55
+    specular_sheen = (torch.clamp(1.0 - torch.abs(spec_yr) / 0.9, 0.0, 1.0) ** 2 * mask * 0.11).view(1, 1, img_size, img_size)
 
     return mask, surface_relief, drop_shadow, specular_sheen
 
@@ -247,28 +265,17 @@ def nasal_strip_attack(
 
     yaw = mesh_info.get("yaw", 0.0) if mesh_info else 0.0
 
-    # Anatomické proporcie Breathe Right pásky:
+    # Anatomické proporcie Breathe Right pásky (so započítaním 3D skrátenia na strmých bokoch dlhého nosa):
     if mesh_info and "points_3d" in mesh_info and len(mesh_info["points_3d"]) > 278:
         pts = mesh_info["points_3d"]
-        alar_w = math.hypot(pts[278][0] - pts[48][0], pts[278][1] - pts[48][1]) * 0.94
-        base_w = max(18.0, min(25.5, alar_w)) * float(width_scale)
+        alar_w = math.hypot(pts[278][0] - pts[48][0], pts[278][1] - pts[48][1]) * 0.89
+        base_w = max(17.8, min(23.6, alar_w)) * float(width_scale)
     else:
-        base_w = max(18.0, min(25.0, eye_dist * 0.52)) * float(width_scale)
-    base_hc = base_w * 0.23   # ~5.2 px v strede chrbta nosa
-    base_hw = base_w * 0.29   # ~6.8 px na bočných krídlach
+        base_w = max(17.8, min(23.6, eye_dist * 0.48)) * float(width_scale)
+    base_hc = base_w * 0.255  # stred chrbta nosa
+    base_hw = base_w * 0.33   # bočné krídla klesajúce po stenách nosa
 
-    if mesh_info and "points_3d" in mesh_info and len(mesh_info["points_3d"]) > 168:
-        pts = mesh_info["points_3d"]
-        p_bridge = pts[168] if len(pts) > 168 else pts[6]
-        p_tip = pts[1] if len(pts) > 1 else pts[4]
-        nv_x = p_tip[0] - p_bridge[0]
-        nv_y = p_tip[1] - p_bridge[1]
-        if abs(nv_x) + abs(nv_y) > 1e-4:
-            strip_angle = math.atan2(nv_y, nv_x) - math.pi * 0.5
-        else:
-            strip_angle = roll
-    else:
-        strip_angle = roll
+    strip_angle = roll
 
     # 2. Vytvorenie 3D motýlej masky a reliéfu
     mask, surface_relief, drop_shadow, specular_sheen = create_nasal_strip_mask(
