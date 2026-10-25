@@ -503,8 +503,15 @@ HEAD_SCRIPTS = """
     pointer-events: none !important;
     overflow: hidden !important;
 }
+body.webcam-flip-video video {
+    transform: scaleX(-1) !important;
+}
 </style>
 <script>
+window.__toggleWebcamFlip = function() {
+    document.body.classList.toggle('webcam-flip-video');
+    return document.body.classList.contains('webcam-flip-video');
+};
 window.__faceDragState = {
     draggingKey: null,
     hoverKey: null,
@@ -603,9 +610,16 @@ window.initFaceDragOverlay = function(imgEl) {
                 ctx.shadowColor = h.color;
                 ctx.shadowBlur = isHover ? 8 : 2;
 
-                const sw = 42, sh = 11, sr = 3;
+                const sScale = parseFloat(state.offsets.strip_scale) || 1.15;
+                const sw = Math.round(37 * sScale), sh = Math.round(11 * sScale), arch = Math.round(4.2 * sScale);
+                const xL = h.x - sw/2, xR = h.x + sw/2;
+                const yTop = h.y - sh/2 - arch * 0.35, yBot = h.y + sh/2 - arch * 0.35;
                 ctx.beginPath();
-                ctx.roundRect(h.x - sw/2, h.y - sh/2, sw, sh, sr);
+                ctx.moveTo(xL, yTop + arch);
+                ctx.quadraticCurveTo(h.x, yTop - arch * 0.85, xR, yTop + arch);
+                ctx.lineTo(xR, yBot + arch);
+                ctx.quadraticCurveTo(h.x, yBot - arch * 0.85, xL, yBot + arch);
+                ctx.closePath();
                 ctx.fill();
                 ctx.stroke();
                 ctx.setLineDash([]);
@@ -613,7 +627,7 @@ window.initFaceDragOverlay = function(imgEl) {
                 ctx.font = "bold 9px monospace";
                 ctx.fillStyle = h.color;
                 ctx.textAlign = "center";
-                ctx.fillText(h.short, h.x, h.y - sh/2 - 3);
+                ctx.fillText(h.short, h.x, yTop - arch * 0.5 - 3);
             } else {
                 ctx.fillStyle = isHover ? "rgba(213, 0, 249, 0.25)" : "rgba(0, 0, 0, 0.05)";
                 ctx.strokeStyle = h.color;
@@ -622,7 +636,8 @@ window.initFaceDragOverlay = function(imgEl) {
                 ctx.shadowColor = h.color;
                 ctx.shadowBlur = isHover ? 8 : 2;
 
-                const pr = isHover ? 11 : 9.5;
+                const dRad = parseFloat(state.offsets.patch_radius) || 5.5;
+                const pr = (dRad * 2.0) + (isHover ? 1.5 : 0.0);
                 ctx.beginPath();
                 ctx.arc(h.x, h.y, pr, 0, Math.PI * 2);
                 ctx.fill();
@@ -896,27 +911,16 @@ def render_live_placement_preview(
             eye_dist = math.sqrt(dx**2 + dy**2)
             if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 278:
                 pts = mesh["points_3d"]
-                alar_w = math.hypot(pts[278][0] - pts[48][0], pts[278][1] - pts[48][1]) * 0.94
-                base_w = max(18.0, min(25.5, alar_w)) * s_w_scale
+                alar_w = math.hypot(pts[278][0] - pts[48][0], pts[278][1] - pts[48][1]) * 0.89
+                base_w = max(17.8, min(23.6, alar_w)) * s_w_scale
             else:
-                base_w = max(18.0, min(25.0, eye_dist * 0.52)) * s_w_scale
+                base_w = max(17.8, min(23.6, eye_dist * 0.48)) * s_w_scale
             yaw = mesh.get("yaw", 0.0) if mesh else 0.0
 
-            if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 168:
-                pts = mesh["points_3d"]
-                p_bridge = pts[168] if len(pts) > 168 else pts[6]
-                p_tip = pts[1] if len(pts) > 1 else pts[4]
-                nv_x = p_tip[0] - p_bridge[0]
-                nv_y = p_tip[1] - p_bridge[1]
-                if abs(nv_x) + abs(nv_y) > 1e-4:
-                    strip_angle = math.atan2(nv_y, nv_x) - math.pi * 0.5
-                else:
-                    strip_angle = roll
-            else:
-                strip_angle = roll
+            strip_angle = roll
 
-            base_hc = base_w * 0.23
-            base_hw = base_w * 0.29
+            base_hc = base_w * 0.255
+            base_hw = base_w * 0.33
 
             mask, relief, _, _ = create_nasal_strip_mask(112, (cy, cx), base_w, base_hc, base_hw, strip_angle, yaw)
             m_np = mask.squeeze().cpu().numpy()
@@ -1057,6 +1061,8 @@ def render_live_placement_preview(
             "left_ox": lox, "left_oy": loy,
             "right_ox": rox, "right_oy": roy,
             "chin_ox": cox, "chin_oy": coy,
+            "strip_scale": float(strip_scale) if strip_scale is not None else 1.0,
+            "patch_radius": float(patch_radius) if patch_radius is not None else 5.5,
         }
         drag_html = build_drag_canvas_html(res_img, base_coords, active_handles, offsets_dict, attack_name)
         is_digital = str(attack_name) in ["FGSM", "PGD", "BIM", "MI-FGSM", "C&W"]
@@ -1161,15 +1167,19 @@ def render_ar_stream_frame(
         return None, None
 
 
-def _format_attack_status(method, similarity, occ_pct=None, offsets=None, hint=""):
-    lines = [f"Metóda: {method}",
-             f"Podobnosť s pôvodnou fotkou: {similarity:.4f} (prah 0.50)"]
+def _format_attack_status(method, similarity, occ_pct=None, offsets=None, hint="", sim_1toN=None):
+    lines = [f"Metóda: {method}"]
+    if sim_1toN is not None:
+        lines.append(f"Podobnosť 1:N (voči databáze): {sim_1toN:.4f} (prah 0.50) | Podobnosť 1:1 (rovnaký výrez): {similarity:.4f}")
+    else:
+        lines.append(f"Podobnosť s pôvodnou fotkou: {similarity:.4f} (prah 0.50)")
     if occ_pct is not None:
         lines.append(f"Zakrytá plocha tváre: {occ_pct:.1f} %")
     if offsets:
         lines.append("Posun (px): " + ", ".join(offsets))
-    if similarity < 0.5:
-        lines.append("Výsledok: model tvár nepovažuje za rovnakú osobu (podobnosť pod 0.50).")
+    eff_sim = sim_1toN if sim_1toN is not None else similarity
+    if eff_sim < 0.5:
+        lines.append("Výsledok: ÚTOK ÚSPEŠNÝ – model osobu v databáze NEROZPOZNAL (podobnosť pod 0.50).")
     else:
         lines.append("Výsledok: model tvár stále rozpoznal (podobnosť nad 0.50)." + (f" {hint}" if hint else ""))
     return "\n".join(lines)
@@ -1186,8 +1196,8 @@ def run_attack(
     patch_position="Koreň nosa (nose_bridge)",
     patch_size_choice="Stredný (7x18 px / 22x8 mm)",
     constellation_pattern="2 nálepky: Obe líca",
-    patch_radius=4.5,
-    strip_scale=1.0,
+    patch_radius=5.5,
+    strip_scale=1.15,
     hybrid_style_mode="Vypnutá (plné RGB / podľa štýlu)",
     ensemble_mode="3 modely | Black-Box: AdaFace (vynechaný z tréningu)",
     strip_ox=0.0,
@@ -1388,6 +1398,24 @@ def run_attack(
 
             if not ens_models:
                 ens_models = {model_name: model}
+
+            # Zistíme priradenú osobu v 1:N galérii a jej centroidy pre jednotlivé modely
+            target_gallery = get_model_gallery(model, model_name)
+            matched_person = None
+            best_clean_g = -1.0
+            for p_key, c_emb in target_gallery.items():
+                sc = F.cosine_similarity(orig_emb, c_emb).item()
+                if sc > best_clean_g:
+                    best_clean_g = sc
+                    matched_person = p_key
+
+            g_cent = {}
+            if matched_person is not None:
+                for k_m, m_obj in ens_models.items():
+                    gal_m = get_model_gallery(m_obj, k_m)
+                    if matched_person in gal_m:
+                        g_cent[k_m] = gal_m[matched_person]
+
             adv_tensor, printable_sheet, hybrid_info = ensemble_hybrid_patch_attack(
                 models=ens_models,
                 image=img_tensor,
@@ -1396,16 +1424,16 @@ def run_attack(
                 dot_pattern=dot_pat,
                 strip_w_scale=s_w_scale,
                 num_iter=h_iters,
+                lr=0.09,
                 eot=True,
-                grad_avg=True,
-                momentum=0.85,
-                feature_weight=0.25,
+                grad_avg=False,
+                feature_weight=0.0,
                 input_diversity=False,
-                update_rule="sign",
                 multiscale=True,
                 ti_kernel=3,
                 pad_model=pad_detector,
                 pad_weight=0.20 if pad_detector is not None else 0.0,
+                gallery_centroids=g_cent if g_cent else None,
                 palette=chosen_palette,
                 logo_mask=chosen_logo_mask,
                 mtcnn=mtcnn,
@@ -1447,11 +1475,16 @@ def run_attack(
     else:
         return None, None, None, "", "", "Neznámy útok."
         
-    # Adversariálny embedding
+    # Adversariálny embedding a 1:N podobnosť voči databáze
     with torch.no_grad():
         adv_emb = model(adv_tensor)
         
     similarity = F.cosine_similarity(orig_emb, adv_emb).item()
+    sim_1toN = None
+    gal_target = get_model_gallery(model, model_name)
+    if gal_target:
+        with torch.no_grad():
+            sim_1toN = max(F.cosine_similarity(adv_emb, c_emb).item() for c_emb in gal_target.values())
     
     # Konverzia späť na obrázky pre zobrazenie
     adv_img_np = denormalize(adv_tensor).squeeze().permute(1, 2, 0).cpu().numpy()
@@ -1510,18 +1543,35 @@ def run_attack(
             label_name = "páska na nose + nálepky na lícach"
         status_text = _format_attack_status(
             label_name, similarity,
-            hybrid_info.get("face_occlusion_pct", 7.8),
+            hybrid_info.get("face_occlusion_pct", 5.7),
             _offset_parts(get_active_handles_for_attack(attack_name, constellation_pattern)),
-            "Skús 120-150 iterácií.")
+            "Skús 160 iterácií alebo mierku pásky 1.15 / nálepky 5.5 px.",
+            sim_1toN=sim_1toN,
+        )
         if "per_model_similarity" in hybrid_info:
-            sims_str = ", ".join(f"{k}: {v:.3f}" for k, v in hybrid_info["per_model_similarity"].items())
+            sim_parts = []
+            with torch.no_grad():
+                for k, v11 in hybrid_info["per_model_similarity"].items():
+                    m_k = models_dict.get(k)
+                    g_k = get_model_gallery(m_k, k) if m_k is not None else {}
+                    if m_k is not None and g_k:
+                        emb_k = m_k(adv_tensor)
+                        v1n = max(F.cosine_similarity(emb_k, c_e).item() for c_e in g_k.values())
+                        sim_parts.append(f"{k}: 1:N={v1n:.3f} (1:1={v11:.3f})")
+                    else:
+                        sim_parts.append(f"{k}: {v11:.3f}")
+            sims_str = ", ".join(sim_parts)
             if "Samostatný" in str(ensemble_mode):
                 status_text += f"\nOptimalizovaný model ({model_name}): {sims_str}"
             else:
                 status_text += f"\nTréningové modely (White-Box Ensemble): {sims_str}"
         if holdout_model_name and holdout_model_name in models_dict:
-            bb_verdict = "PRELOMENÝ (< 0.50)" if similarity < 0.5 else "STÁLE ROZPOZNANÝ (>= 0.50)"
-            status_text += f"\n🎯 Vynechaný Black-Box model ({holdout_model_name}): podobnosť = {similarity:.4f} -> {bb_verdict}"
+            eff_bb = sim_1toN if sim_1toN is not None else similarity
+            bb_verdict = "PRELOMENÝ (< 0.50)" if eff_bb < 0.5 else "STÁLE ROZPOZNANÝ (>= 0.50)"
+            if sim_1toN is not None:
+                status_text += f"\n🎯 Vynechaný Black-Box model ({holdout_model_name}): 1:N = {sim_1toN:.4f} (1:1 = {similarity:.4f}) -> {bb_verdict}"
+            else:
+                status_text += f"\n🎯 Vynechaný Black-Box model ({holdout_model_name}): podobnosť = {similarity:.4f} -> {bb_verdict}"
         if pad_detector is not None:
             with torch.no_grad():
                 p_live_adv = float(pad_detector(adv_tensor).mean().item())
@@ -1615,6 +1665,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             label="Zdroj fotografie",
                             scale=2
                         )
+                        tab1_flip_cam_btn = gr.Button("↔️ Otočiť kameru L/P", variant="secondary", size="sm", scale=1)
                         tab1_retake_btn = gr.Button("Odfoť znova", visible=False, variant="secondary", scale=1)
 
                     tab1_webcam = gr.Image(
@@ -1684,11 +1735,11 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
 
                     ensemble_mode_dropdown = gr.Dropdown(
                         choices=[
+                            "Plný Ensemble 4 modelov (White-Box na všetky)",
                             "Ensemble 3 modelov (Black-Box Leave-One-Out – cieľový model vynechaný)",
                             "Samostatný model (White-Box priamo na cieľový model)",
-                            "Plný Ensemble 4 modelov (White-Box na všetky)",
                         ],
-                        value="Ensemble 3 modelov (Black-Box Leave-One-Out – cieľový model vynechaný)",
+                        value="Plný Ensemble 4 modelov (White-Box na všetky)",
                         label="Režim optimalizácie BioMesh-SpecPatch",
                         visible=True,
                     )
@@ -1697,7 +1748,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         value=format_strategy_info(
                             "BioMesh-SpecPatch (Ensemble + PAD)",
                             "AdaFace" if "AdaFace" in models_dict else "BenchmarkCNN",
-                            "Ensemble 3 modelov (Black-Box Leave-One-Out – cieľový model vynechaný)"
+                            "Plný Ensemble 4 modelov (White-Box na všetky)"
                         ),
                         visible=True,
                     )
@@ -1739,7 +1790,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                                 "4. Robustná široká (mierka 1.35)",
                                 "Vlastná páska (posuvník)",
                             ],
-                            value="1. Reálna Breathe Right (1:1 / mierka 1.0)",
+                            value="2. Športová stredná (mierka 1.15)",
                             label="Predvoľba pásky na nos",
                             allow_custom_value=True,
                             visible=True
@@ -1752,7 +1803,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                                 "4. Maximálne krytie (r = 7.5 px)",
                                 "Vlastné nálepky (posuvník)",
                             ],
-                            value="1. Diskrétne mikro-nálepky (r = 4.5 px)",
+                            value="2. Stredné hydrokoloidné (r = 5.5 px)",
                             label="Predvoľba nálepiek na líca",
                             allow_custom_value=True,
                             visible=True
@@ -1782,7 +1833,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         strip_scale_slider = gr.Slider(
                             minimum=0.7,
                             maximum=1.50,
-                            value=1.0,
+                            value=1.15,
                             step=0.05,
                             label="Veľkosť pásky na nos (1.0 = reálna Breathe Right)",
                             scale=2,
@@ -1791,14 +1842,14 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         patch_radius_slider = gr.Slider(
                             minimum=2.5,
                             maximum=7.5,
-                            value=4.5,
+                            value=5.5,
                             step=0.5,
                             label="Veľkosť nálepiek na lícach (Polomer px)",
                             scale=2,
                             visible=True
                         )
                         live_occlusion_badge = gr.HTML(
-                            value=format_occlusion_badge(2.5, strip_pct=1.6, dots_pct=0.9),
+                            value=format_occlusion_badge(2.6, strip_pct=1.3, dots_pct=1.3),
                             scale=1,
                             visible=True
                         )
@@ -1843,7 +1894,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         with gr.Row():
                             epsilon_slider = gr.Slider(minimum=1/255.0, maximum=32/255.0, value=8/255.0, step=1/255.0, label="Epsilon (sila šumu)", visible=False)
                             alpha_slider = gr.Slider(minimum=1/255.0, maximum=10/255.0, value=2/255.0, step=1/255.0, label="Alpha (krok)", visible=False)
-                            iter_slider = gr.Slider(minimum=1, maximum=500, value=120, step=1, label="Počet iterácií", visible=True)
+                            iter_slider = gr.Slider(minimum=1, maximum=500, value=160, step=1, label="Počet iterácií", visible=True)
 
                         with gr.Group(visible=True) as offsets_accordion:
                             gr.Markdown("##### Jemný posun prvkov (px)")
@@ -1892,7 +1943,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         elif selected_attack in ["Adversarial Patch (Leukoplast)", "Constellation Patch (Pimple Patches)", "Športová páska na nos (Breathe Right)"]:
                             default_iters = 80
                         elif is_hybrid:
-                            default_iters = 120
+                            default_iters = 160
 
                         show_leuko_size = is_leukoplast
                         show_dots_radius = is_const or is_hybrid
@@ -2022,14 +2073,15 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         )
 
                     def on_strip_preset_change(choice, cur_r, img, attack_nm, p_pos, p_sz, c_pat, sox, soy, lox, loy, rox, roy, cox, coy):
-                        if "1." in str(choice) or "Reálna" in str(choice) or "1.0" in str(choice):
-                            s_val = 1.0
-                        elif "2." in str(choice) or "1.15" in str(choice):
+                        c_str = str(choice).strip()
+                        if c_str.startswith("2.") or "1.15" in c_str:
                             s_val = 1.15
-                        elif "3." in str(choice) or "1.25" in str(choice):
+                        elif c_str.startswith("3.") or "1.25" in c_str:
                             s_val = 1.25
-                        elif "4." in str(choice) or "1.35" in str(choice):
+                        elif c_str.startswith("4.") or "1.35" in c_str:
                             s_val = 1.35
+                        elif c_str.startswith("1.") or "Reálna" in c_str or "1.0" in c_str:
+                            s_val = 1.0
                         else:
                             return gr.update(), gr.update(), gr.update(), gr.update()
 
@@ -2053,14 +2105,15 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         return gr.update(value=s_val), prev_img, drag_html, badge_html
 
                     def on_dots_preset_change(choice, cur_s, img, attack_nm, p_pos, p_sz, c_pat, sox, soy, lox, loy, rox, roy, cox, coy):
-                        if "1." in str(choice) or "4.5" in str(choice):
-                            r_val = 4.5
-                        elif "2." in str(choice) or "5.5" in str(choice):
+                        c_str = str(choice).strip()
+                        if c_str.startswith("2.") or "5.5" in c_str:
                             r_val = 5.5
-                        elif "3." in str(choice) or "6.5" in str(choice):
+                        elif c_str.startswith("3.") or "6.5" in c_str:
                             r_val = 6.5
-                        elif "4." in str(choice) or "7.5" in str(choice):
+                        elif c_str.startswith("4.") or "7.5" in c_str:
                             r_val = 7.5
+                        elif c_str.startswith("1.") or "4.5" in c_str:
+                            r_val = 4.5
                         else:
                             return gr.update(), gr.update(), gr.update(), gr.update()
 
@@ -2347,17 +2400,21 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                 with gr.Column():
                     gr.Markdown("### 1. Pridanie tvárí do datasetu")
                     
-                    input_type = gr.Radio(
-                        ["Webkamera", "Nahrať súbor"], 
-                        value="Webkamera", 
-                        label="Zdroj obrázka"
-                    )
+                    with gr.Row():
+                        input_type = gr.Radio(
+                            ["Webkamera", "Nahrať súbor"], 
+                            value="Webkamera", 
+                            label="Zdroj obrázka",
+                            scale=2
+                        )
+                        tab2_flip_cam_btn = gr.Button("↔️ Otočiť kameru L/P", variant="secondary", size="sm", scale=1)
                     
-                    # Webkamera (streaming=False pre fotenie spúšťou)
+                    # Webkamera (streaming=False pre fotenie spúšťou, mirror=False bez zrkadlenia)
                     collect_webcam = gr.Image(
                         sources=["webcam"], 
                         streaming=False, 
                         type="pil",
+                        webcam_options=gr.WebcamOptions(mirror=False),
                         label="Webkamera (odfoť sa a stlač Uložiť fotku)", 
                         visible=True
                     )
@@ -2490,6 +2547,19 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
             inputs=[tab1_source_radio],
             outputs=[tab1_webcam, tab1_upload, tab1_photo_preview, tab1_snap_msg, tab1_retake_btn, tab1_current_img],
             show_progress="hidden"
+        )
+
+        tab1_flip_cam_btn.click(
+            fn=None,
+            inputs=[],
+            outputs=[],
+            js="() => { if (window.__toggleWebcamFlip) window.__toggleWebcamFlip(); }"
+        )
+        tab2_flip_cam_btn.click(
+            fn=None,
+            inputs=[],
+            outputs=[],
+            js="() => { if (window.__toggleWebcamFlip) window.__toggleWebcamFlip(); }"
         )
 
         identify_btn.click(
