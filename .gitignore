@@ -42,3 +42,4 @@ todo.md
 # Batch experiment & generation scripts
 run_*.py
 generate_master_testing_sheet.py
+evaluate_batched.py
