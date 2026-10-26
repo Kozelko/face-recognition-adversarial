@@ -36,3 +36,9 @@ AGENTS.md
 OBHAJOBA_A_TEORIA_PRIRUCKA.md
 PLAN_DP3.md
 RESULTS.md
+THESIS_DISCUSSION_NOTES.md
+todo.md
+
+# Batch experiment & generation scripts
+run_*.py
+generate_master_testing_sheet.py
