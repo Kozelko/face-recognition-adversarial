@@ -526,6 +526,7 @@ window.__toggleWebcamFlip = function() {
 };
 window.__faceDragState = {
     draggingKey: null,
+    dragPointerId: null,
     hoverKey: null,
     dragOffset: { x: 0, y: 0 },
     handles: {},
@@ -713,11 +714,19 @@ window.initFaceDragOverlay = function(imgEl) {
         return best;
     }
 
+    // Drží práve aktívny ukazovateľ – ďalšie prsty počas ťahania sa ignorujú,
+    // inak by sa úchytka pri multitouch skoku prepla na nový bod dotyku.
+    function isActivePointer(e) {
+        return state.dragPointerId === null || state.dragPointerId === undefined || e.pointerId === state.dragPointerId;
+    }
+
     canvas.onpointerdown = (e) => {
+        if (state.draggingKey !== null && state.draggingKey !== undefined) return;
         const p = getCoords(e);
         const k = findHandle(p);
         if (k) {
             state.draggingKey = k;
+            state.dragPointerId = e.pointerId;
             state.dragOffset.x = state.handles[k].x - p.x;
             state.dragOffset.y = state.handles[k].y - p.y;
             try { canvas.setPointerCapture(e.pointerId); } catch(err) {}
@@ -727,6 +736,13 @@ window.initFaceDragOverlay = function(imgEl) {
     };
 
     canvas.onpointermove = (e) => {
+        if (state.draggingKey && !isActivePointer(e)) return;
+        // Poistka proti stratenému pointerup (napr. uvoľnenie mimo okna):
+        // myš bez stlačeného tlačidla ťahanie ukončí, aby nezostalo zaseknuté.
+        if (state.draggingKey && e.pointerType === 'mouse' && e.buttons === 0) {
+            onDragEnd(e);
+            return;
+        }
         const p = getCoords(e);
         if (state.draggingKey) {
             const h = state.handles[state.draggingKey];
@@ -760,9 +776,10 @@ window.initFaceDragOverlay = function(imgEl) {
     };
 
     function onDragEnd(e) {
-        if (state.draggingKey) {
+        if (state.draggingKey && isActivePointer(e)) {
             try { canvas.releasePointerCapture(e.pointerId); } catch(err) {}
             state.draggingKey = null;
+            state.dragPointerId = null;
             state.hoverKey = null;
             canvas.style.cursor = "default";
             draw();
