@@ -17,13 +17,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from attacks.constellation_patch import extract_landmarks, create_elliptical_patch_mask, get_mesh_point_geometry, get_surface_geometry_at_coords
-from attacks.nasal_strip_patch import create_nasal_strip_mask
+from attacks.nasal_strip_patch import create_nasal_strip_mask, compute_nasal_strip_placement
 
+
+# --- Reálne rozmery Breathe Right pásky (mm) ---
+# Plochá páska sa na nos ovine (konce obídu krídla dozadu), preto je jej PREMIETNUTÁ
+# šírka na tvári len ~60 % dĺžky – presne to kreslí create_nasal_strip_mask()
+# (base_hc = 13/58, base_hw = 20/58 šírky). Tlačový hárok kreslí pásku 1:1 v týchto
+# reálnych rozmeroch, takže vytlačený papierik sedí na reálnu Breathe Right.
+STRIP_LEN_MM = 58.0      # celková dĺžka pásky
+STRIP_WAIST_MM = 13.0    # výška v strede (zúžený pás)
+STRIP_WINGS_MM = 20.0    # výška na koncoch (krídelká / max)
+DOT_DIAM_MM = 15.0       # priemer okrúhlych nálepiek
 
 # --- Vysoko rozlíšené textúrové buffery (aby 300 DPI vzor nebol "kockatý") ---
 TEX_STRIP_SIZE = (96, 256)   # (H, W) textúra nosnej pásky
 TEX_DOT_SIZE = (96, 96)      # (H, W) textúra nálepky
-EOT_BATCH = 8                # počet EoT transformácií na optimalizačný krok
+EOT_BATCH = 4                # počet EoT transformácií na optimalizačný krok (zrýchlené z 8 pre svižnú odozvu)
 
 # Je kornia k dispozícii? JPEG simulácia je implementovaná vlastnou blokovou DCT
 # aproximáciou (viď _jpeg_approx), takže na kornii nezávisíme.
@@ -361,58 +371,51 @@ def get_hybrid_geometry(
     dx = rx - lx
     dy = ry - ly
     roll = math.atan2(dy, dx)
-    eye_dist = math.sqrt(dx**2 + dy**2)
-    yaw = mesh_info.get("yaw", 0.0) if mesh_info else 0.0
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     has_mesh = mesh_info is not None and "points_3d" in mesh_info and len(mesh_info["points_3d"]) > 400
     pts = mesh_info["points_3d"] if has_mesh else None
 
-    # Anatomické umiestnenie Breathe Right pásky (stredná až dolná časť chrbta nosa nad chlopňami, mimo očí!)
-    if has_mesh:
-        p195 = pts[195] if len(pts) > 195 else pts[197]
-        p5 = pts[5] if len(pts) > 5 else pts[195]
-        strip_cx = float(p195[0] * 0.50 + p5[0] * 0.50)
-        strip_cy = float(p195[1] * 0.50 + p5[1] * 0.50)
-    else:
-        strip_cx = (lx + rx) * 0.5
-        strip_cy = (ly + ry) * 0.5 + (ny - (ly + ry) * 0.5) * 0.54
-
-    strip_cx = float(np.clip(strip_cx + offset_x + strip_ox, 10.0, 102.0))
-    strip_cy = float(np.clip(strip_cy + offset_y + strip_oy, 10.0, 102.0))
-
-    if has_mesh and len(pts) > 278:
-        alar_w = math.hypot(pts[278][0] - pts[48][0], pts[278][1] - pts[48][1]) * 0.89
-        base_w = max(17.8, min(23.6, alar_w))
-    else:
-        base_w = max(17.8, min(23.6, eye_dist * 0.48))
-    base_w = base_w * float(strip_w_scale)
-
-    # Uhol nosnej pásky sa viaže na skutočný náklon hlavy v rovine obrazu (roll z očí),
-    # aby 3D perspektíva špičky nosa (yaw) nespôsobovala umelé zošikmenie pásky.
-    strip_angle = roll
-
-    base_hc = base_w * 0.255
-    base_hw = base_w * 0.33
+    # Anatomické umiestnenie Breathe Right pásky – spoločný zdroj pravdy s live náhľadom v app.py
+    # (páska sa ukotvuje na nosové krídla, nie na očný stred, a stáča sa spolu s nosom)
+    strip_place = compute_nasal_strip_placement(
+        landmarks, mesh_info,
+        width_scale=float(strip_w_scale),
+        offset_x=float(offset_x) + float(strip_ox),
+        offset_y=float(offset_y) + float(strip_oy),
+    )
+    strip_cx = strip_place["cx"]
+    strip_cy = strip_place["cy"]
+    base_w = strip_place["base_w"]
+    base_hc = strip_place["base_hc"]
+    base_hw = strip_place["base_hw"]
+    eff_w = strip_place["eff_w"]
+    eff_hc = strip_place["eff_hc"]
+    eff_hw = strip_place["eff_hw"]
+    strip_angle = strip_place["angle"]
+    eff_yaw = strip_place["yaw"]
+    arch_f = strip_place["arch"]
+    arch_px = strip_place["arch_px"]
 
     strip_mask, strip_relief, strip_shadow, strip_sheen = create_nasal_strip_mask(
         img_size=img_size,
         center=(strip_cy, strip_cx),
-        width=base_w,
-        height_center=base_hc,
-        height_wings=base_hw,
+        width=eff_w,
+        height_center=eff_hc,
+        height_wings=eff_hw,
         angle_rad=strip_angle,
-        yaw=yaw,
+        yaw=eff_yaw,
         feather=0.70,
-        arch_factor=0.34,
+        arch_factor=arch_f,
+        arch_drop_px=arch_px,
     )
     strip_flat_mask, _, _, _ = create_nasal_strip_mask(
         img_size=img_size,
         center=(strip_cy, strip_cx),
-        width=base_w,
-        height_center=base_hc,
-        height_wings=base_hw,
+        width=eff_w,
+        height_center=eff_hc,
+        height_wings=eff_hw,
         angle_rad=strip_angle,
-        yaw=yaw,
+        yaw=eff_yaw,
         feather=0.70,
         arch_factor=0.0,
     )
@@ -421,14 +424,15 @@ def get_hybrid_geometry(
     strip_relief = strip_relief.to(device)
 
     scy_i, scx_i = int(round(strip_cy)), int(round(strip_cx))
-    s_pad_h = int(math.ceil(base_hw * 0.65)) + 3
-    s_pad_w = int(math.ceil(base_w * 0.5)) + 3
+    s_pad_h = int(math.ceil(eff_hw * 0.65)) + 3
+    s_pad_w = int(math.ceil(eff_w * 0.5)) + 3
     sy1, sy2 = max(0, scy_i - s_pad_h), min(img_size, scy_i + s_pad_h)
     sx1, sx2 = max(0, scx_i - s_pad_w), min(img_size, scx_i + s_pad_w)
 
     boxes = {
         "strip": (sy1, sy2, sx1, sx2),
         "strip_angle": float(strip_angle),
+        "strip_arch": float(arch_f),
         "strip_flat_mask": strip_flat_mask,
     }
 
@@ -654,6 +658,8 @@ def generate_printable_sheet(
         if tensor is None:
             return None
         geo = geometry.get(key, {}) or {}
+        if tensor.dim() == 4:
+            tensor = tensor.squeeze(0)
         p = tensor.detach().permute(1, 2, 0).cpu().numpy()
         rgb = np.clip((p + 1.0) * 0.5 * 255.0, 0, 255).astype(np.uint8)
         m = masks.get(key) if masks else None
@@ -729,94 +735,133 @@ def generate_printable_sheet(
             items.append(rendered)
 
     # --- Layout: pevny format A4 (210 x 297 mm), tlac 1:1 ---
-    margin_mm, top_mm, gap_mm = 10.0, 42.0, 8.0
-    for it in items:
-        it["w_mm"] = it["rgb"].shape[1] / MM_TO_PX
-        it["h_mm"] = it["rgb"].shape[0] / MM_TO_PX
     sheet_w_mm, sheet_h_mm = 210.0, 297.0
     sheet_w = int(round(sheet_w_mm * MM_TO_PX))
     sheet_h = int(round(sheet_h_mm * MM_TO_PX))
     sheet = np.ones((sheet_h, sheet_w, 3), dtype=np.uint8) * 255
 
-    # Text a inštrukcie
-    cv2.putText(sheet, "Adversarial Physical Hybrid Patch - Tlacovy harok (100% mierka)", (30, 45),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2, cv2.LINE_AA)
-    cv2.putText(sheet, "Vytlac na matny papier bez zmeny mierky (Actual Size / 100%).",
-                (30, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (80, 80, 80), 1, cv2.LINE_AA)
-    cv2.putText(sheet, "DOLEZITE PRED STRIHANIM: Na zadnu stranu papiera si ceruzkou napis N^, L^, P^ (sipka ^ = strana HORE k ociam)!",
-                (30, 106), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 20, 20), 1, cv2.LINE_AA)
-
     # Kalibračné meradlo (50 mm)
-    bar_x, bar_y = 30, 138
-    bar_len = int(50 * MM_TO_PX)
+    bar_x, bar_y = 100, 120
+    bar_len = int(round(50.0 * MM_TO_PX))
     cv2.line(sheet, (bar_x, bar_y), (bar_x + bar_len, bar_y), (0, 0, 0), 3)
-    cv2.line(sheet, (bar_x, bar_y - 10), (bar_x, bar_y + 10), (0, 0, 0), 3)
-    cv2.line(sheet, (bar_x + bar_len, bar_y - 10), (bar_x + bar_len, bar_y + 10), (0, 0, 0), 3)
-    cv2.putText(sheet, "Kontrolne meritko: presne 50 mm (over pravitkom po tlaci)", (bar_x, bar_y + 32),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.line(sheet, (bar_x, bar_y - 14), (bar_x, bar_y + 14), (0, 0, 0), 3)
+    cv2.line(sheet, (bar_x + bar_len, bar_y - 14), (bar_x + bar_len, bar_y + 14), (0, 0, 0), 3)
+    cv2.putText(sheet, "50.0 mm (100% mierka)", (bar_x + 15, bar_y - 18),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 1, cv2.LINE_AA)
 
-    short_tags = {
-        "strip": "[N] NOS",
-        "left_dot": "[L] LAVE LICE (vlavo na monitore)",
-        "right_dot": "[P] PRAVE LICE (vpravo na monitore)",
-        "chin_dot": "[B] BRADA (volitelne)",
-    }
+    def _to_rgb(t):
+        if isinstance(t, np.ndarray):
+            return t if t.dtype == np.uint8 else np.clip(t * 255.0, 0, 255).astype(np.uint8)
+        if isinstance(t, torch.Tensor):
+            p = t.detach().squeeze()
+            if p.dim() == 3:
+                p = p.permute(1, 2, 0)
+            p_np = p.cpu().numpy()
+            if p_np.min() < -0.05:
+                return np.clip((p_np + 1.0) * 0.5 * 255.0, 0, 255).astype(np.uint8)
+            return np.clip(p_np * 255.0, 0, 255).astype(np.uint8)
+        return np.zeros((96, 96, 3), dtype=np.uint8)
 
-    def _paste(rgb, alpha, x_px, y_px):
-        h, w = rgb.shape[:2]
-        y_px, x_px = max(0, int(y_px)), max(0, int(x_px))
-        if y_px + h > sheet.shape[0] or x_px + w > sheet.shape[1]:
-            return
-        a = (alpha.astype(np.float32) / 255.0)[..., None]
-        region = sheet[y_px:y_px + h, x_px:x_px + w].astype(np.float32)
-        sheet[y_px:y_px + h, x_px:x_px + w] = np.clip(
-            region * (1.0 - a) + rgb.astype(np.float32) * a, 0.0, 255.0).astype(np.uint8)
+    def _draw_exact_strip(tex_rgb, w_mm=STRIP_LEN_MM, hc_mm=STRIP_WAIST_MM,
+                          hw_mm=STRIP_WINGS_MM, x_pos=100, y_pos=260):
+        W = int(round(w_mm * MM_TO_PX))
+        Hc = int(round(hc_mm * MM_TO_PX))
+        Hw = int(round(hw_mm * MM_TO_PX))
+        R_x = int(round(8.5 * MM_TO_PX))
+        R_y = Hw // 2
 
-    def _paste_row(y0_px, note=""):
-        x_cursor = int(round(margin_mm * MM_TO_PX))
-        if note:
-            cv2.putText(sheet, note, (x_cursor, y0_px - 34),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 2, cv2.LINE_AA)
+        canvas = np.zeros((Hw, W), dtype=np.uint8)
+        cx = W // 2
+        cy = Hw // 2
+        half_w = W // 2
+
+        x_limit = half_w - R_x
+        xs = np.linspace(-x_limit, x_limit, 300)
+
+        pts_top = []
+        pts_bot = []
+        for x in xs:
+            u = x / x_limit
+            s = 0.5 * (1.0 - math.cos(abs(u) * math.pi))
+            h_local = Hc + (Hw - Hc) * (s ** 1.1)
+            pts_top.append((int(round(cx + x)), int(round(cy - h_local * 0.5))))
+            pts_bot.append((int(round(cx + x)), int(round(cy + h_local * 0.5))))
+
+        pts_all = []
+        pts_all.extend(pts_top)
+        for a in np.linspace(-math.pi/2, math.pi/2, 50):
+            pts_all.append((int(round(cx + x_limit + R_x * math.cos(a))), int(round(cy + R_y * math.sin(a)))))
+        pts_all.extend(pts_bot[::-1])
+        for a in np.linspace(math.pi/2, 3*math.pi/2, 50):
+            pts_all.append((int(round(cx - x_limit + R_x * math.cos(a))), int(round(cy + R_y * math.sin(a)))))
+
+        pts_arr = np.array(pts_all, dtype=np.int32)
+        cv2.fillPoly(canvas, [pts_arr], 255)
+
+        tex_res = cv2.resize(tex_rgb, (W, Hw), interpolation=cv2.INTER_CUBIC)
+        tex_res = cv2.bilateralFilter(tex_res, d=7, sigmaColor=35, sigmaSpace=7)
+
+        a_norm = (canvas.astype(np.float32) / 255.0)[:, :, np.newaxis]
+        target_roi = sheet[y_pos:y_pos + Hw, x_pos:x_pos + W].astype(np.float32)
+        blended = tex_res.astype(np.float32) * a_norm + target_roi * (1.0 - a_norm)
+        sheet[y_pos:y_pos + Hw, x_pos:x_pos + W] = np.clip(blended, 0, 255).astype(np.uint8)
+
+        poly_sheet = pts_arr + np.array([x_pos, y_pos])
+        cv2.polylines(sheet, [poly_sheet], True, (60, 60, 60), 2, cv2.LINE_AA)
+
+        arr_cx = x_pos + W // 2
+        arr_top = y_pos - 18
+        cv2.fillPoly(sheet, [np.array([[arr_cx, arr_top - 18], [arr_cx - 12, arr_top], [arr_cx + 12, arr_top]], dtype=np.int32)], (0, 140, 0))
+        cv2.putText(sheet, "HORE (k ociam)", (arr_cx + 18, arr_top - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 130, 0), 1, cv2.LINE_AA)
+        return W, Hw
+
+    def _draw_exact_circle(tex_rgb, d_mm=15.0, x_pos=100, y_pos=260, label=""):
+        D = int(round(d_mm * MM_TO_PX))
+        R = D // 2
+        mask_c = np.zeros((D, D), dtype=np.uint8)
+        cv2.circle(mask_c, (R, R), R, 255, -1, cv2.LINE_AA)
+
+        tex_res = cv2.resize(tex_rgb, (D, D), interpolation=cv2.INTER_CUBIC)
+        tex_res = cv2.bilateralFilter(tex_res, d=7, sigmaColor=35, sigmaSpace=7)
+
+        a_norm = (mask_c.astype(np.float32) / 255.0)[:, :, np.newaxis]
+        target_roi = sheet[y_pos:y_pos + D, x_pos:x_pos + D].astype(np.float32)
+        blended = tex_res.astype(np.float32) * a_norm + target_roi * (1.0 - a_norm)
+        sheet[y_pos:y_pos + D, x_pos:x_pos + D] = np.clip(blended, 0, 255).astype(np.uint8)
+
+        cv2.circle(sheet, (x_pos + R, y_pos + R), R, (60, 60, 60), 2, cv2.LINE_AA)
+        if label:
+            cv2.putText(sheet, label, (x_pos + R - 18, y_pos - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (60, 60, 60), 1, cv2.LINE_AA)
+        return D, D
+
+    # Vykreslenie presných tvarov podľa reálnych rozmerov
+    has_strip = ("strip" in patches) or ("bandage" in patches)
+    if has_strip:
+        s_tex = _to_rgb(patches.get("strip", patches.get("bandage")))
+        l_tex = _to_rgb(patches.get("left_dot", s_tex))
+        r_tex = _to_rgb(patches.get("right_dot", s_tex))
+
+        rows = [
+            ("SADA 1 (hlavna)", 260),
+            ("SADA 2 (rezerva)", 720),
+        ]
+        for name, y_row in rows:
+            cv2.putText(sheet, name, (100, y_row - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (40, 40, 40), 1, cv2.LINE_AA)
+            cx = 100
+            w_strip, h_strip = _draw_exact_strip(s_tex, STRIP_LEN_MM, STRIP_WAIST_MM,
+                                                 STRIP_WINGS_MM, cx, y_row)
+            cx += w_strip + 100
+            d_dot = int(round(DOT_DIAM_MM * MM_TO_PX))
+            dot_y = y_row + (h_strip - d_dot) // 2
+            d1, _ = _draw_exact_circle(l_tex, DOT_DIAM_MM, cx, dot_y, "Lice L")
+            cx += d1 + 60
+            d2, _ = _draw_exact_circle(r_tex, DOT_DIAM_MM, cx, dot_y, "Lice P")
+    else:
+        # Fallback pre iba-bodkové konštelácie
+        cx, cy = 100, 260
         for it in items:
-            h_i, w_i = it["rgb"].shape[:2]
-            cx = x_cursor + w_i // 2
-            # Šípka HORE (^ HORE) tesne nad vrchným okrajom nálepky
-            ay = max(12, y0_px - 8)
-            pts_arrow = np.array([[cx, ay - 12], [cx - 9, ay], [cx + 9, ay]], dtype=np.int32)
-            cv2.fillPoly(sheet, [pts_arrow], (0, 140, 0))
-            cv2.putText(sheet, "HORE", (cx + 13, ay - 1),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 130, 0), 1, cv2.LINE_AA)
-
-            _paste(it["rgb"], it["alpha"], x_cursor, y0_px)
-
-            # Presná strihacia línia (tenký sivý obrys pre nožnice po celom obvode nálepky)
-            if "strip" in it["key"]:
-                cnts_a, _ = cv2.findContours((it["alpha"] > 32).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
-                if cnts_a:
-                    c_main = max(cnts_a, key=cv2.contourArea)
-                    poly = cv2.approxPolyDP(c_main, 0.003 * cv2.arcLength(c_main, True), True)
-                    poly_shifted = poly + np.array([x_cursor, y0_px])
-                    cv2.polylines(sheet, [poly_shifted], True, (80, 80, 80), 2, cv2.LINE_AA)
-            else:
-                rad = min(h_i, w_i) // 2
-                cy_dot = y0_px + h_i // 2
-                cx_dot = x_cursor + w_i // 2
-                cv2.circle(sheet, (cx_dot, cy_dot), rad, (80, 80, 80), 2, cv2.LINE_AA)
-
-            tag_str = short_tags.get(it["key"], it["label"])
-            dim_str = f"({it['mm_w']:.1f} x {it['mm_h']:.1f} mm)"
-            cv2.putText(sheet, tag_str, (x_cursor, y0_px + h_i + 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1, cv2.LINE_AA)
-            cv2.putText(sheet, dim_str, (x_cursor, y0_px + h_i + 46),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, (90, 90, 90), 1, cv2.LINE_AA)
-            x_cursor += int(round((it["w_mm"] + gap_mm + 8.0) * MM_TO_PX))
-
-    row_h_px = max([it["rgb"].shape[0] for it in items], default=0)
-    _paste_row(int(round((top_mm + 6.0) * MM_TO_PX)), "SADA 1 (hlavna)")
-    _paste_row(int(round((top_mm + 6.0) * MM_TO_PX)) + row_h_px + int(round(52 * MM_TO_PX)), "SADA 2 (rezerva)")
-
-    cv2.putText(sheet, "Poznamka: Tlac s profilom farieb Standard/sRGB na matny papier (mierka 100%).",
-                (30, sheet_h - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1, cv2.LINE_AA)
+            _draw_exact_circle(it["rgb"], DOT_DIAM_MM, cx, cy, it["key"])
+            cx += int(round((DOT_DIAM_MM + 10.0) * MM_TO_PX))
 
     if output_path:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -830,9 +875,12 @@ def generate_printable_sheet(
     except Exception:
         pass
 
-    print("[PRINTABLE] mm_per_px=%.4f sheet=%.1fx%.1fmm " % (mm_per_px, sheet_w_mm, sheet_h_mm) +
-          " ".join("%s=%.2fx%.2fmm(%dx%dpx)" % (it["key"], it["mm_w"], it["mm_h"],
-                                                 it["rgb"].shape[1], it["rgb"].shape[0]) for it in items))
+    # Pozor: "medzivýpočet" je interný render; na hárku sa kreslia PRESNÉ reálne rozmery.
+    print("[PRINTABLE] mm_per_px=%.4f sheet=%.1fx%.1fmm | vykreslené: páska=%.1fx%.1fmm "
+          "(stred %.1fmm), nálepky=%.1fmm kruhy | medzivýpočet: %s"
+          % (mm_per_px, sheet_w_mm, sheet_h_mm, STRIP_LEN_MM, STRIP_WINGS_MM, STRIP_WAIST_MM,
+             DOT_DIAM_MM,
+             " ".join("%s=%.2fx%.2fmm" % (it["key"], it["mm_w"], it["mm_h"]) for it in items)))
 
     return sheet
 

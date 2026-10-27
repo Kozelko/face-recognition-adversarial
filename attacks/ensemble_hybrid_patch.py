@@ -650,6 +650,8 @@ def ensemble_hybrid_patch_attack(
                 if sc < best_score:
                     best_score = sc
                     best_params = {k: v.detach().clone() for k, v in params.items()}
+                if it >= 35 and all(s < 0.40 for s in cur_sims):
+                    break
             direction = torch.stack(model_grads).sum(0)
             dir_rms = direction.pow(2).mean().sqrt().clamp_min(1e-8)
             direction = direction / dir_rms
@@ -694,6 +696,8 @@ def ensemble_hybrid_patch_attack(
                 if sc < best_score:
                     best_score = sc
                     best_params = {k: v.detach().clone() for k, v in params.items()}
+                if it >= 35 and all(s < 0.40 for s in cur_sims):
+                    break
 
             total = loss + reg_total
             if pad_term is not None:

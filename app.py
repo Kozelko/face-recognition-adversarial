@@ -42,11 +42,16 @@ from attacks.adversarial_patch import adversarial_patch_attack, get_patch_geomet
 from attacks.constellation_patch import constellation_patch_attack, create_elliptical_patch_mask, get_anatomical_patch_specs, extract_landmarks, get_surface_geometry_at_coords
 from attacks.hybrid_patch import hybrid_patch_attack, get_hybrid_geometry
 from attacks.ensemble_hybrid_patch import ensemble_hybrid_patch_attack
-from attacks.nasal_strip_patch import nasal_strip_attack, generate_printable_nasal_strip_sheet, create_nasal_strip_mask
+from attacks.nasal_strip_patch import nasal_strip_attack, generate_printable_nasal_strip_sheet, create_nasal_strip_mask, compute_nasal_strip_placement
 from models.pad_minifasnet import load_pad_model
 
 # Globálne nastavenia
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Jediný zdroj pravdy pre rozsah jemného posunu prvkov (px v priestore 112x112).
+# Používa ho JS drag overlay (clamp úchytky) aj Gradio slidery, aby sa úchytka
+# nikdy nedostala mimo rozsah, ktorý vie slider reprezentovať.
+OFFSET_LIMIT_PX = 25.0
 DATASET_DIR = "data/custom_dataset"
 
 # Detekcia tvárí (MTCNN + Haar Cascade fallback)
@@ -411,22 +416,29 @@ _live_preview_cache = {
     "mesh_info": None,
 }
 
-def extract_base_patch_coords(landmarks, mesh, nose_is_dot=False):
+def extract_base_patch_coords(landmarks, mesh, nose_is_dot=False, strip_scale=1.0):
     if landmarks is None:
         return None
     lx, ly = landmarks[0]
     rx, ry = landmarks[1]
     nx, ny = landmarks[2]
 
-    if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 197:
-        pts = mesh["points_3d"]
-        p195 = pts[195]
-        p5 = pts[5] if len(pts) > 5 else pts[195]
-        strip_x = float(p195[0] * 0.50 + p5[0] * 0.50) * 2.0
-        strip_y = float(p195[1] * 0.50 + p5[1] * 0.50) * 2.0
+    if nose_is_dot:
+        # Nosová bodka konštelácie (Pimple Patches) – drží sa stredu nosového mostíka
+        if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 197:
+            pts = mesh["points_3d"]
+            p195 = pts[195]
+            p5 = pts[5] if len(pts) > 5 else pts[195]
+            strip_x = float(p195[0] * 0.50 + p5[0] * 0.50) * 2.0
+            strip_y = float(p195[1] * 0.50 + p5[1] * 0.50) * 2.0
+        else:
+            strip_x = ((lx + rx) * 0.5) * 2.0
+            strip_y = ((ly + ry) * 0.5 + (ny - (ly + ry) * 0.5) * 0.54) * 2.0
     else:
-        strip_x = ((lx + rx) * 0.5) * 2.0
-        strip_y = ((ly + ry) * 0.5 + (ny - (ly + ry) * 0.5) * 0.54) * 2.0
+        # Športová páska na nos – presne rovnaké ukotvenie, aké použije samotný útok
+        place = compute_nasal_strip_placement(landmarks, mesh, width_scale=float(strip_scale) if strip_scale else 1.0)
+        strip_x = float(place["cx"]) * 2.0
+        strip_y = float(place["cy"]) * 2.0
 
     if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 205:
         left_x = float(mesh["points_3d"][205][0]) * 2.0
@@ -525,11 +537,14 @@ window.__faceDragState = {
 window.__getFaceDragOffsets = function() {
     const state = window.__faceDragState;
     if (!state || !state.base) return null;
+    // Rozsah sliderov (jeden zdroj pravdy s backendom cez data-offsets).
+    const lim = parseFloat(state.offsets && state.offsets.offset_limit) || 25.0;
 
     function getOff(k, axis) {
         if (!state.handles || !state.handles[k] || !state.handles[k].active || !state.base[k]) return 0.0;
         const d = (state.handles[k][axis] - state.base[k][axis]) / 2.0;
-        return Math.round(d * 2.0) / 2.0;
+        const dc = Math.max(-lim, Math.min(lim, d));
+        return Math.round(dc * 2.0) / 2.0;
     }
 
     return {
@@ -582,10 +597,22 @@ window.initFaceDragOverlay = function(imgEl) {
     state.offsets = curOffsets;
     state.handles = {};
 
+    // Úchytka sa nikdy nesmie dostať mimo rozsah Gradio sliderov (±offset_limit px),
+    // inak by sa posun ticho stratil pri synchronizácii so serverom.
+    const limitCanvasPx = (parseFloat(curOffsets.offset_limit) || 25.0) * 2.0;
+    function clampHandle(k, x, y) {
+        const b = state.base[k] || { x: x, y: y };
+        return {
+            x: Math.max(12, Math.min(212, Math.max(b.x - limitCanvasPx, Math.min(b.x + limitCanvasPx, x)))),
+            y: Math.max(12, Math.min(212, Math.max(b.y - limitCanvasPx, Math.min(b.y + limitCanvasPx, y))))
+        };
+    }
+
     for (const k of Object.keys(base)) {
+        const p0 = clampHandle(k, base[k].x + (curOffsets[k + '_ox'] || 0) * 2, base[k].y + (curOffsets[k + '_oy'] || 0) * 2);
         state.handles[k] = {
-            x: Math.max(12, Math.min(212, base[k].x + (curOffsets[k + '_ox'] || 0) * 2)),
-            y: Math.max(12, Math.min(212, base[k].y + (curOffsets[k + '_oy'] || 0) * 2)),
+            x: p0.x,
+            y: p0.y,
             label: base[k].label,
             short: base[k].short || k.toUpperCase(),
             color: base[k].color,
@@ -611,23 +638,34 @@ window.initFaceDragOverlay = function(imgEl) {
                 ctx.shadowBlur = isHover ? 8 : 2;
 
                 const sScale = parseFloat(state.offsets.strip_scale) || 1.15;
-                const sw = Math.round(37 * sScale), sh = Math.round(11 * sScale), arch = Math.round(4.2 * sScale);
-                const xL = h.x - sw/2, xR = h.x + sw/2;
-                const yTop = h.y - sh/2 - arch * 0.35, yBot = h.y + sh/2 - arch * 0.35;
+                // Presná veľkosť a náklon pásky z backendu (aby obrys sedel 1:1 s vykreslenou páskou)
+                const wPx = parseFloat(state.offsets.strip_w_px) || 0;
+                const hPx = parseFloat(state.offsets.strip_h_px) || 0;
+                const sw = wPx > 0 ? wPx : Math.round(37 * sScale);
+                const sh = hPx > 0 ? hPx : Math.round(11 * sScale);
+                const arch = Math.round(4.2 * sScale);
+                const sAng = (parseFloat(state.offsets.strip_angle_deg) || 0) * Math.PI / 180.0;
+                const xL = -sw/2, xR = sw/2;
+                const yTop = -sh/2 - arch * 0.35, yBot = sh/2 - arch * 0.35;
+
+                ctx.save();
+                ctx.translate(h.x, h.y);
+                ctx.rotate(sAng);
                 ctx.beginPath();
                 ctx.moveTo(xL, yTop + arch);
-                ctx.quadraticCurveTo(h.x, yTop - arch * 0.85, xR, yTop + arch);
+                ctx.quadraticCurveTo(0, yTop - arch * 0.85, xR, yTop + arch);
                 ctx.lineTo(xR, yBot + arch);
-                ctx.quadraticCurveTo(h.x, yBot - arch * 0.85, xL, yBot + arch);
+                ctx.quadraticCurveTo(0, yBot - arch * 0.85, xL, yBot + arch);
                 ctx.closePath();
                 ctx.fill();
                 ctx.stroke();
+                ctx.restore();
                 ctx.setLineDash([]);
 
                 ctx.font = "bold 9px monospace";
                 ctx.fillStyle = h.color;
                 ctx.textAlign = "center";
-                ctx.fillText(h.short, h.x, yTop - arch * 0.5 - 3);
+                ctx.fillText(h.short, h.x, h.y + yTop - arch * 0.5 - 3);
             } else {
                 ctx.fillStyle = isHover ? "rgba(213, 0, 249, 0.25)" : "rgba(0, 0, 0, 0.05)";
                 ctx.strokeStyle = h.color;
@@ -692,8 +730,9 @@ window.initFaceDragOverlay = function(imgEl) {
         const p = getCoords(e);
         if (state.draggingKey) {
             const h = state.handles[state.draggingKey];
-            h.x = Math.max(12, Math.min(212, p.x + state.dragOffset.x));
-            h.y = Math.max(12, Math.min(212, p.y + state.dragOffset.y));
+            const cp = clampHandle(state.draggingKey, p.x + state.dragOffset.x, p.y + state.dragOffset.y);
+            h.x = cp.x;
+            h.y = cp.y;
             draw();
             const ox = (Math.round(((h.x - state.base[state.draggingKey].x) / 2) * 2) / 2).toFixed(1);
             const oy = (Math.round(((h.y - state.base[state.draggingKey].y) / 2) * 2) / 2).toFixed(1);
@@ -834,6 +873,28 @@ def format_occlusion_badge(tot_pct: float, strip_pct: float | None = None, dots_
     </div>
     """
 
+def _clamp_offset_px(v) -> float:
+    """Drží jemný posun prvku v rozsahu, ktorý reprezentujú Gradio slidery."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(f):
+        return 0.0
+    return max(-OFFSET_LIMIT_PX, min(OFFSET_LIMIT_PX, f))
+
+
+def _mask_bbox_px(mask_np, scale=2.0):
+    """Rozmer (šírka, výška) obrysu masky v pixeloch náhľadového plátna (112 px * scale)."""
+    ys, xs = np.where(mask_np > 0.25)
+    if len(ys) == 0:
+        return None
+    return (
+        float(xs.max() - xs.min() + 1) * scale,
+        float(ys.max() - ys.min() + 1) * scale,
+    )
+
+
 def render_live_placement_preview(
     image,
     attack_name,
@@ -875,56 +936,35 @@ def render_live_placement_preview(
             return None, build_drag_canvas_html(None, None, None, None, attack_name), format_occlusion_badge(0.0)
 
         canvas = face_np.copy()
-        sox = float(strip_ox) if strip_ox is not None else 0.0
-        soy = float(strip_oy) if strip_oy is not None else 0.0
-        lox = float(left_ox) if left_ox is not None else 0.0
-        loy = float(left_oy) if left_oy is not None else 0.0
-        rox = float(right_ox) if right_ox is not None else 0.0
-        roy = float(right_oy) if right_oy is not None else 0.0
-        cox = float(chin_ox) if chin_ox is not None else 0.0
-        coy = float(chin_oy) if chin_oy is not None else 0.0
+        sox = _clamp_offset_px(strip_ox)
+        soy = _clamp_offset_px(strip_oy)
+        lox = _clamp_offset_px(left_ox)
+        loy = _clamp_offset_px(left_oy)
+        rox = _clamp_offset_px(right_ox)
+        roy = _clamp_offset_px(right_oy)
+        cox = _clamp_offset_px(chin_ox)
+        coy = _clamp_offset_px(chin_oy)
 
         cur_tot_pct = 0.0
         cur_strip_pct = 0.0
         cur_dots_pct = 0.0
+        strip_box_px = None
+        strip_angle_deg = 0.0
 
         # Športová páska na nos (Breathe Right)
         if attack_name == "Športová páska na nos (Breathe Right)":
             s_w_scale = float(strip_scale) if strip_scale is not None else 1.0
-            if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 197:
-                pts = mesh["points_3d"]
-                p195 = pts[195]
-                p5 = pts[5] if len(pts) > 5 else pts[195]
-                cx, cy = float(p195[0] * 0.50 + p5[0] * 0.50), float(p195[1] * 0.50 + p5[1] * 0.50)
-            else:
-                lx, ly = lms[0]
-                rx, ry = lms[1]
-                nx, ny = lms[2]
-                cx = (lx + rx) * 0.5
-                cy = (ly + ry) * 0.5 + (ny - (ly + ry) * 0.5) * 0.54
-
-            cx = float(np.clip(cx + sox, 10.0, 102.0))
-            cy = float(np.clip(cy + soy, 10.0, 102.0))
-            dx = lms[1][0] - lms[0][0]
-            dy = lms[1][1] - lms[0][1]
-            roll = math.atan2(dy, dx)
-            eye_dist = math.sqrt(dx**2 + dy**2)
-            if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 278:
-                pts = mesh["points_3d"]
-                alar_w = math.hypot(pts[278][0] - pts[48][0], pts[278][1] - pts[48][1]) * 0.89
-                base_w = max(17.8, min(23.6, alar_w)) * s_w_scale
-            else:
-                base_w = max(17.8, min(23.6, eye_dist * 0.48)) * s_w_scale
-            yaw = mesh.get("yaw", 0.0) if mesh else 0.0
-
-            strip_angle = roll
-
-            base_hc = base_w * 0.255
-            base_hw = base_w * 0.33
-
-            mask, relief, _, _ = create_nasal_strip_mask(112, (cy, cx), base_w, base_hc, base_hw, strip_angle, yaw)
+            place = compute_nasal_strip_placement(lms, mesh, width_scale=s_w_scale, offset_x=sox, offset_y=soy)
+            mask, relief, _, _ = create_nasal_strip_mask(
+                112, (place["cy"], place["cx"]),
+                place["eff_w"], place["eff_hc"], place["eff_hw"],
+                place["angle"], place["yaw"],
+                arch_factor=place["arch"], arch_drop_px=place["arch_px"],
+            )
             m_np = mask.squeeze().cpu().numpy()
             r_np = relief.squeeze().cpu().numpy()
+            strip_box_px = _mask_bbox_px(m_np)
+            strip_angle_deg = float(place["angle"]) * 180.0 / math.pi
 
             cur_tot_pct = float(mask.sum().item()) / (112.0 * 112.0) * 100.0
             cur_strip_pct = cur_tot_pct
@@ -1024,6 +1064,8 @@ def render_live_placement_preview(
             strip_r = boxes["strip_relief"]
             sm_np = strip_m.squeeze().cpu().numpy()
             sr_np = strip_r.squeeze().cpu().numpy()
+            strip_box_px = _mask_bbox_px(sm_np)
+            strip_angle_deg = float(boxes.get("strip_angle", 0.0)) * 180.0 / math.pi
             if "rgb" in str(patch_pos).lower() or "farebn" in str(patch_pos).lower() or "art" in str(patch_pos).lower():
                 s_col = np.array([235, 90, 50], dtype=np.float32)
                 d_col = np.array([245, 190, 40], dtype=np.float32)
@@ -1054,7 +1096,10 @@ def render_live_placement_preview(
 
         res_img = cv2.resize(canvas, (224, 224), interpolation=cv2.INTER_LANCZOS4)
         nose_is_dot = ("Constellation" in attack_name) and get_active_handles_for_attack(attack_name, constellation_pattern)["strip"]
-        base_coords = extract_base_patch_coords(lms, mesh, nose_is_dot=nose_is_dot)
+        base_coords = extract_base_patch_coords(
+            lms, mesh, nose_is_dot=nose_is_dot,
+            strip_scale=float(strip_scale) if strip_scale is not None else 1.0,
+        )
         active_handles = get_active_handles_for_attack(attack_name, constellation_pattern)
         offsets_dict = {
             "strip_ox": sox, "strip_oy": soy,
@@ -1063,6 +1108,12 @@ def render_live_placement_preview(
             "chin_ox": cox, "chin_oy": coy,
             "strip_scale": float(strip_scale) if strip_scale is not None else 1.0,
             "patch_radius": float(patch_radius) if patch_radius is not None else 5.5,
+            "strip_w_px": strip_box_px[0] if strip_box_px else 0.0,
+            "strip_h_px": strip_box_px[1] if strip_box_px else 0.0,
+            "strip_angle_deg": strip_angle_deg,
+            # Rozsah posunu, do ktorého JS drží úchytky (aby sa úchytka nikdy
+            # nedostala mimo rozsah sliderov) – jeden zdroj pravdy s backendom.
+            "offset_limit": OFFSET_LIMIT_PX,
         }
         drag_html = build_drag_canvas_html(res_img, base_coords, active_handles, offsets_dict, attack_name)
         is_digital = str(attack_name) in ["FGSM", "PGD", "BIM", "MI-FGSM", "C&W"]
@@ -1645,7 +1696,30 @@ def handle_finetune(progress=gr.Progress()):
             return msg, gr.update(choices=list(models_dict.keys()), value="BenchmarkCNN (Finetuned)")
     return msg, gr.update()
 
-# Gradio UI
+# Gradio UI Custom CSS pre striktný readonly vzhľad dropdownov (zamedzenie prepisovania textu a blikania kurzora)
+custom_css = """
+.strict-select input,
+.strict-select .secondary-wrap input,
+.strict-select div[data-testid="dropdown"] input,
+.strict-select input[role="combobox"],
+.strict-select input[role="listbox"],
+.gr-dropdown input {
+    caret-color: transparent !important;
+    cursor: pointer !important;
+    user-select: none !important;
+    -webkit-user-select: none !important;
+}
+.strict-select,
+.strict-select div,
+.strict-select .wrap,
+.strict-select .wrap-inner,
+.strict-select .secondary-wrap,
+.gr-dropdown,
+.gr-dropdown div {
+    cursor: pointer !important;
+}
+"""
+
 with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
     gr.Markdown("# Rozpoznávanie tváre a adversariálne útoky")
     gr.Markdown("Testovanie útokov na modely rozpoznávania tváre a zber vlastných fotiek.")
@@ -1724,12 +1798,16 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             ], 
                             value="BioMesh-SpecPatch (Ensemble + PAD)", 
                             label="Typ Útoku",
+                            filterable=False,
+                            elem_classes=["strict-select"],
                             scale=1,
                         )
                         model_dropdown = gr.Dropdown(
                             choices=list(models_dict.keys()), 
                             value="AdaFace" if "AdaFace" in models_dict else "BenchmarkCNN", 
                             label="Cieľový Model (vyhodnotenie)",
+                            filterable=False,
+                            elem_classes=["strict-select"],
                             scale=1,
                         )
 
@@ -1741,6 +1819,8 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         ],
                         value="Plný Ensemble 4 modelov (White-Box na všetky)",
                         label="Režim optimalizácie BioMesh-SpecPatch",
+                        filterable=False,
+                        elem_classes=["strict-select"],
                         visible=True,
                     )
 
@@ -1766,7 +1846,8 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             ],
                             value="1. Čierna športová páska (Athlete Black - Breathe Right)",
                             label="Vzhľad a materiál náplastí (Materiál & Dizajn)",
-                            allow_custom_value=True,
+                            filterable=False,
+                            elem_classes=["strict-select"],
                             visible=True
                         )
                         constellation_pattern_dropdown = gr.Dropdown(
@@ -1777,7 +1858,8 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             ],
                             value="2 nálepky: Obe líca",
                             label="Rozmiestnenie nálepiek (pre Hybrid útok)",
-                            allow_custom_value=True,
+                            filterable=False,
+                            elem_classes=["strict-select"],
                             visible=True
                         )
 
@@ -1792,7 +1874,8 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             ],
                             value="2. Športová stredná (mierka 1.15)",
                             label="Predvoľba pásky na nos",
-                            allow_custom_value=True,
+                            filterable=False,
+                            elem_classes=["strict-select"],
                             visible=True
                         )
                         dots_preset_dropdown = gr.Dropdown(
@@ -1805,14 +1888,16 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             ],
                             value="2. Stredné hydrokoloidné (r = 5.5 px)",
                             label="Predvoľba nálepiek na líca",
-                            allow_custom_value=True,
+                            filterable=False,
+                            elem_classes=["strict-select"],
                             visible=True
                         )
                         patch_size_dropdown = gr.Dropdown(
                             choices=["Stredný (7x18 px / 22x8 mm)", "Malý (5x14 px / 18x6 mm)", "Veľký (9x22 px / 26x10 mm)"],
                             value="Stredný (7x18 px / 22x8 mm)",
                             label="Veľkosť leukoplastu",
-                            allow_custom_value=True,
+                            filterable=False,
+                            elem_classes=["strict-select"],
                             visible=False
                         )
                         hybrid_style_dropdown = gr.Dropdown(
@@ -1825,7 +1910,8 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             ],
                             value="Vypnutá (plné RGB / podľa štýlu)",
                             label="Režim vzoru (paleta / logo)",
-                            allow_custom_value=True,
+                            filterable=False,
+                            elem_classes=["strict-select"],
                             visible=False
                         )
 
@@ -1894,22 +1980,22 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         with gr.Row():
                             epsilon_slider = gr.Slider(minimum=1/255.0, maximum=32/255.0, value=8/255.0, step=1/255.0, label="Epsilon (sila šumu)", visible=False)
                             alpha_slider = gr.Slider(minimum=1/255.0, maximum=10/255.0, value=2/255.0, step=1/255.0, label="Alpha (krok)", visible=False)
-                            iter_slider = gr.Slider(minimum=1, maximum=500, value=160, step=1, label="Počet iterácií", visible=True)
+                            iter_slider = gr.Slider(minimum=10, maximum=250, value=65, step=5, label="Počet iterácií", visible=True)
 
                         with gr.Group(visible=True) as offsets_accordion:
                             gr.Markdown("##### Jemný posun prvkov (px)")
                             with gr.Row(visible=True) as strip_offset_row:
-                                strip_ox_slider = gr.Slider(-25.0, 25.0, value=0.0, step=0.5, label="Nos / páska X (px)")
-                                strip_oy_slider = gr.Slider(-25.0, 25.0, value=0.0, step=0.5, label="Nos / páska Y (px)")
+                                strip_ox_slider = gr.Slider(-OFFSET_LIMIT_PX, OFFSET_LIMIT_PX, value=0.0, step=0.5, label="Nos / páska X (px)")
+                                strip_oy_slider = gr.Slider(-OFFSET_LIMIT_PX, OFFSET_LIMIT_PX, value=0.0, step=0.5, label="Nos / páska Y (px)")
                             with gr.Row(visible=True) as left_offset_row:
-                                left_ox_slider = gr.Slider(-25.0, 25.0, value=0.0, step=0.5, label="Ľavé líce X (px)")
-                                left_oy_slider = gr.Slider(-25.0, 25.0, value=0.0, step=0.5, label="Ľavé líce Y (px)")
+                                left_ox_slider = gr.Slider(-OFFSET_LIMIT_PX, OFFSET_LIMIT_PX, value=0.0, step=0.5, label="Ľavé líce X (px)")
+                                left_oy_slider = gr.Slider(-OFFSET_LIMIT_PX, OFFSET_LIMIT_PX, value=0.0, step=0.5, label="Ľavé líce Y (px)")
                             with gr.Row(visible=True) as right_offset_row:
-                                right_ox_slider = gr.Slider(-25.0, 25.0, value=0.0, step=0.5, label="Pravé líce X (px)")
-                                right_oy_slider = gr.Slider(-25.0, 25.0, value=0.0, step=0.5, label="Pravé líce Y (px)")
+                                right_ox_slider = gr.Slider(-OFFSET_LIMIT_PX, OFFSET_LIMIT_PX, value=0.0, step=0.5, label="Pravé líce X (px)")
+                                right_oy_slider = gr.Slider(-OFFSET_LIMIT_PX, OFFSET_LIMIT_PX, value=0.0, step=0.5, label="Pravé líce Y (px)")
                             with gr.Row(visible=False) as chin_offset_row:
-                                chin_ox_slider = gr.Slider(-25.0, 25.0, value=0.0, step=0.5, label="Brada X (px)")
-                                chin_oy_slider = gr.Slider(-25.0, 25.0, value=0.0, step=0.5, label="Brada Y (px)")
+                                chin_ox_slider = gr.Slider(-OFFSET_LIMIT_PX, OFFSET_LIMIT_PX, value=0.0, step=0.5, label="Brada X (px)")
+                                chin_oy_slider = gr.Slider(-OFFSET_LIMIT_PX, OFFSET_LIMIT_PX, value=0.0, step=0.5, label="Brada Y (px)")
 
                     with gr.Accordion("Uložiť fotku do datasetu", open=False):
                         with gr.Row():
@@ -1943,7 +2029,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         elif selected_attack in ["Adversarial Patch (Leukoplast)", "Constellation Patch (Pimple Patches)", "Športová páska na nos (Breathe Right)"]:
                             default_iters = 80
                         elif is_hybrid:
-                            default_iters = 160
+                            default_iters = 65
 
                         show_leuko_size = is_leukoplast
                         show_dots_radius = is_const or is_hybrid
@@ -1965,7 +2051,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                                 ],
                                 value="1. Čierna športová páska (Athlete Black - Breathe Right)",
                                 label="Vzhľad a materiál náplastí (Materiál & Dizajn)",
-                                allow_custom_value=True
+                                filterable=False,
                             )
                         elif is_leukoplast:
                             pos_update = gr.update(
@@ -1973,10 +2059,10 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                                 choices=["Koreň nosa (nose_bridge)", "Líce (cheek)", "Čelo (forehead)"],
                                 value="Koreň nosa (nose_bridge)",
                                 label="Poloha leukoplastu (pre Patch útok)",
-                                allow_custom_value=True
+                                filterable=False,
                             )
                         else:
-                            pos_update = gr.update(visible=False, allow_custom_value=True)
+                            pos_update = gr.update(visible=False)
 
                         default_pattern = "2 nálepky: Obe líca" if is_hybrid else "3 body: Nos + Obe líca"
                         if is_hybrid:
@@ -1985,7 +2071,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                                 choices=["2 nálepky: Obe líca", "3 nálepky: Obe líca + Brada", "1 nálepka: Iba ľavé líce"],
                                 value="2 nálepky: Obe líca",
                                 label="Rozmiestnenie nálepiek (pre Hybrid útok)",
-                                allow_custom_value=True
+                                filterable=False,
                             )
                         elif is_const:
                             pattern_update = gr.update(
@@ -2002,10 +2088,10 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                                 ],
                                 value="3 body: Nos + Obe líca",
                                 label="Vzor mikro-nálepiek / pieh (pre Constellation útok)",
-                                allow_custom_value=True
+                                filterable=False,
                             )
                         else:
-                            pattern_update = gr.update(visible=False, allow_custom_value=True)
+                            pattern_update = gr.update(visible=False)
 
                         active = get_active_handles_for_attack(selected_attack, default_pattern)
                         info_text = format_strategy_info(selected_attack, current_model, current_ens_mode)
@@ -2256,14 +2342,14 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
 
                     def handle_drag_sync(img, attack_nm, p_pos, p_sz, c_pat, p_rad, s_scale, strip_ox, strip_oy, left_ox, left_oy, right_ox, right_oy, chin_ox, chin_oy):
                         active = get_active_handles_for_attack(attack_nm, c_pat)
-                        sox = float(strip_ox) if active["strip"] and strip_ox is not None else 0.0
-                        soy = float(strip_oy) if active["strip"] and strip_oy is not None else 0.0
-                        lox = float(left_ox) if active["left"] and left_ox is not None else 0.0
-                        loy = float(left_oy) if active["left"] and left_oy is not None else 0.0
-                        rox = float(right_ox) if active["right"] and right_ox is not None else 0.0
-                        roy = float(right_oy) if active["right"] and right_oy is not None else 0.0
-                        cox = float(chin_ox) if active["chin"] and chin_ox is not None else 0.0
-                        coy = float(chin_oy) if active["chin"] and chin_oy is not None else 0.0
+                        sox = _clamp_offset_px(strip_ox) if active["strip"] else 0.0
+                        soy = _clamp_offset_px(strip_oy) if active["strip"] else 0.0
+                        lox = _clamp_offset_px(left_ox) if active["left"] else 0.0
+                        loy = _clamp_offset_px(left_oy) if active["left"] else 0.0
+                        rox = _clamp_offset_px(right_ox) if active["right"] else 0.0
+                        roy = _clamp_offset_px(right_oy) if active["right"] else 0.0
+                        cox = _clamp_offset_px(chin_ox) if active["chin"] else 0.0
+                        coy = _clamp_offset_px(chin_oy) if active["chin"] else 0.0
 
                         prev_img, drag_html, badge_html = render_live_placement_preview(
                             image=img,
@@ -2713,4 +2799,4 @@ if __name__ == "__main__":
     os.makedirs(DATASET_DIR, exist_ok=True)
     
     # Spustenie aplikácie na porte 7860 (default)
-    app.launch(server_name="0.0.0.0", server_port=7860, share=False, head=HEAD_SCRIPTS)
+    app.launch(server_name="0.0.0.0", server_port=7860, share=False, head=HEAD_SCRIPTS, css=custom_css)
