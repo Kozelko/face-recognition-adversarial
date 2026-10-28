@@ -494,7 +494,7 @@ def apply_realistic_blending(
         base_skin = image
 
     skin_lum = 0.299 * image[:, 0:1] + 0.587 * image[:, 1:2] + 0.114 * image[:, 2:3]
-    skin_light_mult = torch.clamp(skin_lum * 0.35 + 1.0, 0.65, 1.35)
+    skin_light_mult = torch.clamp(skin_lum * 0.45 + 1.0, 0.45, 1.35)
 
     if dome is not None:
         lit_patches = torch.clamp(canvas_patches * skin_light_mult * dome, -1.0, 1.0)
@@ -661,8 +661,9 @@ def constellation_patch_attack(
         base_color = torch.tensor([0.72, 0.65, 0.16], device=device).view(1, 1, 3, 1, 1)
         opacity = 0.92
     else:
-        base_color = torch.tensor([0.68, 0.45, 0.22], device=device).view(1, 1, 3, 1, 1)
-        opacity = 0.88
+        skin_sample = image[:, :, 40:80, 25:87].mean(dim=(-2, -1), keepdim=True).view(1, 1, 3, 1, 1).detach()
+        base_color = torch.clamp(skin_sample * 0.65 + torch.tensor([0.18, 0.10, 0.02], device=device).view(1, 1, 3, 1, 1) * 0.35, -0.75, 0.65)
+        opacity = 0.86
 
     delta = nn.Parameter(torch.zeros((1, num_spots, 1, patch_dim, patch_dim), device=device))
     optimizer = torch.optim.Adam([delta], lr=lr)

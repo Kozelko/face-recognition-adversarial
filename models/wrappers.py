@@ -32,6 +32,10 @@ class BenchmarkCNNWrapper(FaceModelWrapper):
         from models.benchmark_cnn import BenchmarkCNN
         
         checkpoint = None
+        if checkpoint_path and not os.path.exists(checkpoint_path):
+            candidate = os.path.join(os.path.dirname(__file__), "checkpoints", os.path.basename(checkpoint_path))
+            if os.path.exists(candidate):
+                checkpoint_path = candidate
         if checkpoint_path and os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
             if num_classes is None:
@@ -144,6 +148,10 @@ class ArcFaceWrapper(FaceModelWrapper):
         from models.iresnet import iresnet50
         
         self.model = iresnet50(num_features=512)
+        if not os.path.exists(model_path):
+            candidate = os.path.join(os.path.dirname(__file__), "checkpoints", os.path.basename(model_path))
+            if os.path.exists(candidate):
+                model_path = candidate
         if os.path.exists(model_path):
             checkpoint = torch.load(model_path, map_location=device)
             # Podpora pre rôzne formáty uloženia PyTorch checkpointov
@@ -192,6 +200,10 @@ class AdaFaceWrapper(FaceModelWrapper):
             from models.adaface_net import build_model
             self.model = build_model('ir_50')
             
+            if not os.path.exists(model_path):
+                candidate = os.path.join(os.path.dirname(__file__), "checkpoints", os.path.basename(model_path))
+                if os.path.exists(candidate):
+                    model_path = candidate
             if os.path.exists(model_path):
                 checkpoint = torch.load(model_path, map_location=device)
                 state_dict = checkpoint.get('state_dict', checkpoint)

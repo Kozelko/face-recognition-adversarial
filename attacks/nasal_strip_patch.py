@@ -131,7 +131,7 @@ def apply_nasal_strip_blending(
         base_image = image
 
     skin_lum = 0.299 * image[:, 0:1] + 0.587 * image[:, 1:2] + 0.114 * image[:, 2:3]
-    light_mult = torch.clamp(skin_lum * 0.30 + 1.0, 0.70, 1.30)
+    light_mult = torch.clamp(skin_lum * 0.45 + 1.0, 0.45, 1.30)
 
     lit_strip = torch.clamp(canvas_strip * light_mult * surface_relief, -1.0, 1.0)
 
@@ -349,14 +349,14 @@ def compute_nasal_strip_placement(
         nose_angle = math.atan2(ay, ax)
         alar_mid_x = float(alar_l[0] + alar_r[0]) * 0.5
         alar_mid_y = float(alar_l[1] + alar_r[1]) * 0.5
-        alar_w = nose_w * 0.89
-        base_w = max(17.8, min(23.6, alar_w)) * float(width_scale)
+        alar_w = max(nose_w * 1.24, eye_dist * 0.58)
+        base_w = max(23.5, min(29.0, alar_w)) * float(width_scale)
     else:
         nose_angle = None
-        base_w = max(17.8, min(23.6, eye_dist * 0.48)) * float(width_scale)
+        base_w = max(23.5, min(29.0, eye_dist * 0.58)) * float(width_scale)
 
-    base_hc = base_w * (13.0 / 58.0)  # stred chrbta nosa
-    base_hw = base_w * (20.0 / 58.0)  # bočné krídla klesajúce po stenách nosa
+    base_hc = base_w * (16.0 / 58.0)  # stred chrbta nosa (reálna 2D projekcia 58×20 mm pásky)
+    base_hw = base_w * (23.0 / 58.0)  # bočné krídla klesajúce po stenách nosa
 
     # Stred pásky = nosový mostík medzi landmarkami 195 a 5 (presne ako na oficiálnej
     # fotke Breathe Right). Nesedí na špičke nosa ani na jeho koreni.
