@@ -33,7 +33,7 @@ DOT_DIAM_MM = 15.0       # priemer okrúhlych nálepiek
 # --- Vysoko rozlíšené textúrové buffery (aby 300 DPI vzor nebol "kockatý") ---
 TEX_STRIP_SIZE = (96, 256)   # (H, W) textúra nosnej pásky
 TEX_DOT_SIZE = (96, 96)      # (H, W) textúra nálepky
-EOT_BATCH = 4                # počet EoT transformácií na optimalizačný krok (zrýchlené z 8 pre svižnú odozvu)
+EOT_BATCH = 4                # počet EoT transformácií na krok (rýchla odozva + silný fyzický transfer)
 
 # Je kornia k dispozícii? JPEG simulácia je implementovaná vlastnou blokovou DCT
 # aproximáciou (viď _jpeg_approx), takže na kornii nezávisíme.
@@ -75,10 +75,10 @@ def _illumination_gain(image: torch.Tensor) -> torch.Tensor:
     h, w = blurred.shape[-2], blurred.shape[-1]
     y0, y1 = int(h * 0.22), int(h * 0.68)
     x0, x1 = int(w * 0.22), int(w * 0.78)
-    mean_lum = blurred[:, :, y0:y1, x0:x1].mean(dim=(-2, -1), keepdim=True).clamp_min(0.22)
+    mean_lum = blurred[:, :, y0:y1, x0:x1].mean(dim=(-2, -1), keepdim=True).clamp_min(0.10)
     rel_illum = blurred / mean_lum
-    ambient_factor = torch.clamp(mean_lum / 0.48, 0.72, 1.08)
-    return torch.clamp(rel_illum * ambient_factor * 0.96, 0.55, 1.15)
+    ambient_factor = torch.clamp(mean_lum / 0.48, 0.45, 1.15)
+    return torch.clamp(rel_illum * ambient_factor * 0.95, 0.35, 1.25)
 
 
 def _region_field(field: torch.Tensor, box: tuple[int, int, int, int], tex_h: int, tex_w: int, pad: int = 2) -> torch.Tensor:
@@ -129,7 +129,7 @@ def _build_canvas(image, region_specs, gain_full, relief_full, blend):
     for key, (texture, box, tex_size) in region_specs.items():
         comp_hr = _compose_region(texture, box, tex_size, image, gain_full, relief_full, blend)
         y1, y2, x1, x2 = box
-        box_patch = F.interpolate(comp_hr, size=(y2 - y1, x2 - x1), mode="bilinear", align_corners=False)
+        box_patch = F.interpolate(comp_hr, size=(y2 - y1, x2 - x1), mode="bilinear", align_corners=False, antialias=True)
         canvas[:, :, y1:y2, x1:x2] = box_patch
         comps[key] = comp_hr
     return canvas, comps
@@ -560,6 +560,7 @@ def get_hybrid_geometry(
 
     boxes["strip_mask"] = strip_mask
     boxes["strip_relief"] = strip_relief
+    boxes["strip_w_scale"] = float(strip_w_scale)
     boxes["dot_radius_eff"] = float(r_dot)
     boxes["left_mask"] = l_mask
     boxes["left_relief"] = l_relief
@@ -690,9 +691,7 @@ def generate_printable_sheet(
         tw = max(2, int(round(mm_w * MM_TO_PX)))
         th = max(2, int(round(mm_h * MM_TO_PX)))
         rgb = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_CUBIC)
-        # Jemné vyhladenie hrán makro-kociek pre prirodzený tlačový vzhľad textílie:
-        rgb = cv2.bilateralFilter(rgb, d=7, sigmaColor=35, sigmaSpace=7)
-        alpha = cv2.resize(alpha, (tw, th), interpolation=cv2.INTER_LANCZOS4)
+        alpha = cv2.resize(alpha, (tw, th), interpolation=cv2.INTER_CUBIC)
 
         # Aplikácia strip_angle na finálny renderovaný vzor na hárku
         rot_deg = float(geo.get("rotate_deg", 0.0))
@@ -703,17 +702,17 @@ def generate_printable_sheet(
             pad[y0:y0 + th, x0:x0 + tw, :3] = rgb
             pad[y0:y0 + th, x0:x0 + tw, 3] = alpha
             rm = cv2.getRotationMatrix2D((diag / 2.0, diag / 2.0), rot_deg, 1.0)
-            rot = cv2.warpAffine(pad, rm, (diag, diag), flags=cv2.INTER_LANCZOS4,
+            rot = cv2.warpAffine(pad, rm, (diag, diag), flags=cv2.INTER_CUBIC,
                                  borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
             rgb, alpha = rot[:, :, :3], rot[:, :, 3]
 
         # Orezanie prázdneho priehľadného okraja boxu a výpočet skutočného rozmeru masky v mm
-        ys_nz, xs_nz = np.nonzero(alpha > 16)
+        ys_nz, xs_nz = np.nonzero(alpha > 20)
         if len(ys_nz) > 0 and len(xs_nz) > 0:
-            ay1 = max(0, int(ys_nz.min()) - 2)
-            ay2 = min(alpha.shape[0], int(ys_nz.max()) + 3)
-            ax1 = max(0, int(xs_nz.min()) - 2)
-            ax2 = min(alpha.shape[1], int(xs_nz.max()) + 3)
+            ay1 = max(0, int(ys_nz.min()))
+            ay2 = min(alpha.shape[0], int(ys_nz.max()) + 1)
+            ax1 = max(0, int(xs_nz.min()))
+            ax2 = min(alpha.shape[1], int(xs_nz.max()) + 1)
             mm_w = float((int(xs_nz.max()) - int(xs_nz.min()) + 1) / MM_TO_PX)
             mm_h = float((int(ys_nz.max()) - int(ys_nz.min()) + 1) / MM_TO_PX)
             rgb = rgb[ay1:ay2, ax1:ax2]
@@ -740,6 +739,17 @@ def generate_printable_sheet(
     sheet_h = int(round(sheet_h_mm * MM_TO_PX))
     sheet = np.ones((sheet_h, sheet_w, 3), dtype=np.uint8) * 255
 
+    strip_geo = geometry.get("strip", {}) or {}
+    strip_w_sc = float(strip_geo.get("strip_w_scale", 1.15))
+    strip_scale_ratio = float(np.clip(strip_w_sc / 1.15, 0.75, 1.35))
+    eff_strip_len_mm = STRIP_LEN_MM * strip_scale_ratio
+    eff_strip_waist_mm = STRIP_WAIST_MM * strip_scale_ratio
+    eff_strip_wings_mm = STRIP_WINGS_MM * strip_scale_ratio
+
+    dot_geo_any = geometry.get("left_dot") or geometry.get("right_dot") or {}
+    r_dot_eff_val = float(dot_geo_any.get("dot_radius_eff", 5.5))
+    eff_dot_diam_mm = DOT_DIAM_MM * float(np.clip(r_dot_eff_val / 5.5, 0.65, 1.50))
+
     # Kalibračné meradlo (50 mm)
     bar_x, bar_y = 100, 120
     bar_len = int(round(50.0 * MM_TO_PX))
@@ -748,6 +758,18 @@ def generate_printable_sheet(
     cv2.line(sheet, (bar_x + bar_len, bar_y - 14), (bar_x + bar_len, bar_y + 14), (0, 0, 0), 3)
     cv2.putText(sheet, "50.0 mm (100% mierka)", (bar_x + 15, bar_y - 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(
+        sheet,
+        f"Paska: {eff_strip_len_mm:.1f}x{eff_strip_wings_mm:.1f} mm | Nalepky: {eff_dot_diam_mm:.1f} mm | Lave lice = pod tvoje vlastne lave oko",
+        (bar_x + bar_len + 45, bar_y - 18),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (40, 40, 40), 1, cv2.LINE_AA,
+    )
+    cv2.putText(
+        sheet,
+        "TIP: Neprelepuj vrch lesklou paskou (odlesk z monitora). Lep zospodu obojstrannou paskou alebo tycinkovym lepidlom.",
+        (bar_x, bar_y + 38),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (90, 90, 90), 1, cv2.LINE_AA,
+    )
 
     def _to_rgb(t):
         if isinstance(t, np.ndarray):
@@ -762,12 +784,71 @@ def generate_printable_sheet(
             return np.clip(p_np * 255.0, 0, 255).astype(np.uint8)
         return np.zeros((96, 96, 3), dtype=np.uint8)
 
+    def _extract_active_strip_tex(tex_rgb):
+        m = masks.get("strip") if masks else None
+        if m is None:
+            return tex_rgb
+        m_arr = np.asarray(m, dtype=np.float32)
+        if m_arr.ndim == 3:
+            m_arr = m_arr[0]
+        if m_arr.shape[:2] != tex_rgb.shape[:2]:
+            m_arr = cv2.resize(m_arr, (tex_rgb.shape[1], tex_rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+        rot_deg = float((geometry.get("strip") or {}).get("rotate_deg", 0.0))
+        work_rgb = tex_rgb
+        work_m = m_arr
+        if abs(rot_deg) > 0.25:
+            h0, w0 = work_rgb.shape[:2]
+            rm = cv2.getRotationMatrix2D((w0 / 2.0, h0 / 2.0), rot_deg, 1.0)
+            work_rgb = cv2.warpAffine(work_rgb, rm, (w0, h0), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            work_m = cv2.warpAffine(work_m, rm, (w0, h0), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+        ys_nz, xs_nz = np.nonzero(work_m > 0.14)
+        if len(ys_nz) > 4 and len(xs_nz) > 4:
+            ay1, ay2 = int(ys_nz.min()), int(ys_nz.max()) + 1
+            ax1, ax2 = int(xs_nz.min()), int(xs_nz.max()) + 1
+            return np.ascontiguousarray(work_rgb[ay1:ay2, ax1:ax2])
+        return work_rgb
+
+    def _extract_active_dot_tex(tex_rgb, key, D):
+        flat = (geometry.get(key) or {}).get("flat")
+        if flat is not None:
+            img_size = 112
+            y1, y2, x1, x2 = flat["box"]
+            py1, py2 = max(0, y1), min(img_size, y2)
+            px1, px2 = max(0, x1), min(img_size, x2)
+            ch, cw = max(1, py2 - py1), max(1, px2 - px1)
+            th_, tw_ = tex_rgb.shape[0], tex_rgb.shape[1]
+            r_img = max(1.0, float(flat["r"]))
+            c = (D - 1) / 2.0
+            s = (D / 2.0) / r_img
+            jj, ii = np.meshgrid(np.arange(D, dtype=np.float32), np.arange(D, dtype=np.float32))
+            fx, fy = (jj - c) / s, (ii - c) / s
+            a = float(flat["tilt"])
+            cs = float(flat["cos"])
+            ux, uy, vx, vy = math.cos(a), math.sin(a), -math.sin(a), math.cos(a)
+            fu, fv = fx * ux + fy * uy, fx * vx + fy * vy
+            sx = cs * fu * ux + fv * vx
+            sy = cs * fu * uy + fv * vy
+            map_x = ((flat["cx"] + sx - px1 + 0.5) * tw_ / cw - 0.5).astype(np.float32)
+            map_y = ((flat["cy"] + sy - py1 + 0.5) * th_ / ch - 0.5).astype(np.float32)
+            return cv2.remap(tex_rgb, map_x, map_y, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        m = masks.get(key) if masks else None
+        if m is not None:
+            m_arr = np.asarray(m, dtype=np.float32)
+            if m_arr.ndim == 3:
+                m_arr = m_arr[0]
+            if m_arr.shape[:2] != tex_rgb.shape[:2]:
+                m_arr = cv2.resize(m_arr, (tex_rgb.shape[1], tex_rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+            ys_nz, xs_nz = np.nonzero(m_arr > 0.14)
+            if len(ys_nz) > 4 and len(xs_nz) > 4:
+                tex_rgb = tex_rgb[int(ys_nz.min()):int(ys_nz.max()) + 1, int(xs_nz.min()):int(xs_nz.max()) + 1]
+        return cv2.resize(tex_rgb, (D, D), interpolation=cv2.INTER_CUBIC)
+
     def _draw_exact_strip(tex_rgb, w_mm=STRIP_LEN_MM, hc_mm=STRIP_WAIST_MM,
                           hw_mm=STRIP_WINGS_MM, x_pos=100, y_pos=260):
         W = int(round(w_mm * MM_TO_PX))
         Hc = int(round(hc_mm * MM_TO_PX))
         Hw = int(round(hw_mm * MM_TO_PX))
-        R_x = int(round(8.5 * MM_TO_PX))
+        R_x = int(round(8.5 * (w_mm / STRIP_LEN_MM) * MM_TO_PX))
         R_y = Hw // 2
 
         canvas = np.zeros((Hw, W), dtype=np.uint8)
@@ -775,7 +856,7 @@ def generate_printable_sheet(
         cy = Hw // 2
         half_w = W // 2
 
-        x_limit = half_w - R_x
+        x_limit = max(4, half_w - R_x)
         xs = np.linspace(-x_limit, x_limit, 300)
 
         pts_top = []
@@ -789,17 +870,17 @@ def generate_printable_sheet(
 
         pts_all = []
         pts_all.extend(pts_top)
-        for a in np.linspace(-math.pi/2, math.pi/2, 50):
+        for a in np.linspace(-math.pi / 2, math.pi / 2, 50):
             pts_all.append((int(round(cx + x_limit + R_x * math.cos(a))), int(round(cy + R_y * math.sin(a)))))
         pts_all.extend(pts_bot[::-1])
-        for a in np.linspace(math.pi/2, 3*math.pi/2, 50):
+        for a in np.linspace(math.pi / 2, 3 * math.pi / 2, 50):
             pts_all.append((int(round(cx - x_limit + R_x * math.cos(a))), int(round(cy + R_y * math.sin(a)))))
 
         pts_arr = np.array(pts_all, dtype=np.int32)
         cv2.fillPoly(canvas, [pts_arr], 255)
 
-        tex_res = cv2.resize(tex_rgb, (W, Hw), interpolation=cv2.INTER_CUBIC)
-        tex_res = cv2.bilateralFilter(tex_res, d=7, sigmaColor=35, sigmaSpace=7)
+        active_strip_rgb = _extract_active_strip_tex(tex_rgb)
+        tex_res = cv2.resize(active_strip_rgb, (W, Hw), interpolation=cv2.INTER_CUBIC)
 
         a_norm = (canvas.astype(np.float32) / 255.0)[:, :, np.newaxis]
         target_roi = sheet[y_pos:y_pos + Hw, x_pos:x_pos + W].astype(np.float32)
@@ -810,19 +891,18 @@ def generate_printable_sheet(
         cv2.polylines(sheet, [poly_sheet], True, (60, 60, 60), 2, cv2.LINE_AA)
 
         arr_cx = x_pos + W // 2
-        arr_top = y_pos - 18
-        cv2.fillPoly(sheet, [np.array([[arr_cx, arr_top - 18], [arr_cx - 12, arr_top], [arr_cx + 12, arr_top]], dtype=np.int32)], (0, 140, 0))
-        cv2.putText(sheet, "HORE (k ociam)", (arr_cx + 18, arr_top - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 130, 0), 1, cv2.LINE_AA)
+        arr_top = y_pos - 16
+        cv2.fillPoly(sheet, [np.array([[arr_cx, arr_top - 16], [arr_cx - 11, arr_top], [arr_cx + 11, arr_top]], dtype=np.int32)], (0, 140, 0))
+        cv2.putText(sheet, "HORE (k ociam)", (arr_cx + 16, arr_top - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (0, 130, 0), 1, cv2.LINE_AA)
         return W, Hw
 
-    def _draw_exact_circle(tex_rgb, d_mm=15.0, x_pos=100, y_pos=260, label=""):
+    def _draw_exact_circle(tex_rgb, key="", d_mm=15.0, x_pos=100, y_pos=260, label=""):
         D = int(round(d_mm * MM_TO_PX))
         R = D // 2
         mask_c = np.zeros((D, D), dtype=np.uint8)
         cv2.circle(mask_c, (R, R), R, 255, -1, cv2.LINE_AA)
 
-        tex_res = cv2.resize(tex_rgb, (D, D), interpolation=cv2.INTER_CUBIC)
-        tex_res = cv2.bilateralFilter(tex_res, d=7, sigmaColor=35, sigmaSpace=7)
+        tex_res = _extract_active_dot_tex(tex_rgb, key, D) if key else cv2.resize(tex_rgb, (D, D), interpolation=cv2.INTER_CUBIC)
 
         a_norm = (mask_c.astype(np.float32) / 255.0)[:, :, np.newaxis]
         target_roi = sheet[y_pos:y_pos + D, x_pos:x_pos + D].astype(np.float32)
@@ -830,56 +910,73 @@ def generate_printable_sheet(
         sheet[y_pos:y_pos + D, x_pos:x_pos + D] = np.clip(blended, 0, 255).astype(np.uint8)
 
         cv2.circle(sheet, (x_pos + R, y_pos + R), R, (60, 60, 60), 2, cv2.LINE_AA)
+        # Jemná zelená šípka HORE na hornom okraji kruhu pre presnú rotáciu na líci
+        top_cx = x_pos + R
+        top_cy = y_pos - 5
+        cv2.fillPoly(sheet, [np.array([[top_cx, top_cy - 10], [top_cx - 7, top_cy], [top_cx + 7, top_cy]], dtype=np.int32)], (0, 140, 0))
         if label:
-            cv2.putText(sheet, label, (x_pos + R - 18, y_pos - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (60, 60, 60), 1, cv2.LINE_AA)
+            cv2.putText(sheet, label, (max(20, x_pos + R - 62), y_pos - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (50, 50, 50), 1, cv2.LINE_AA)
         return D, D
 
-    # Vykreslenie presných tvarov podľa reálnych rozmerov
+    # Vykreslenie presných tvarov podľa reálnych rozmerov (2 sady vedľa seba / pod sebou na A4)
     has_strip = ("strip" in patches) or ("bandage" in patches)
     if has_strip:
         s_tex = _to_rgb(patches.get("strip", patches.get("bandage")))
-        l_tex = _to_rgb(patches.get("left_dot", s_tex))
-        r_tex = _to_rgb(patches.get("right_dot", s_tex))
+        has_l = "left_dot" in patches
+        has_r = "right_dot" in patches
+        has_c = "chin_dot" in patches
+        l_tex = _to_rgb(patches["left_dot"]) if has_l else None
+        r_tex = _to_rgb(patches["right_dot"]) if has_r else None
+        c_tex = _to_rgb(patches["chin_dot"]) if has_c else None
 
         rows = [
-            ("SADA 1 (hlavna)", 260),
-            ("SADA 2 (rezerva)", 720),
+            ("SADA 1 (hlavna)", 280),
+            ("SADA 2 (rezerva)", 760),
+            ("SADA 3 (rezerva)", 1240),
         ]
         for name, y_row in rows:
-            cv2.putText(sheet, name, (100, y_row - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (40, 40, 40), 1, cv2.LINE_AA)
+            cv2.putText(sheet, name, (100, y_row - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (40, 40, 40), 1, cv2.LINE_AA)
             cx = 100
-            w_strip, h_strip = _draw_exact_strip(s_tex, STRIP_LEN_MM, STRIP_WAIST_MM,
-                                                 STRIP_WINGS_MM, cx, y_row)
-            cx += w_strip + 100
-            d_dot = int(round(DOT_DIAM_MM * MM_TO_PX))
+            w_strip, h_strip = _draw_exact_strip(
+                s_tex, eff_strip_len_mm, eff_strip_waist_mm, eff_strip_wings_mm, cx, y_row
+            )
+            cx += w_strip + 90
+            d_dot = int(round(eff_dot_diam_mm * MM_TO_PX))
             dot_y = y_row + (h_strip - d_dot) // 2
-            d1, _ = _draw_exact_circle(l_tex, DOT_DIAM_MM, cx, dot_y, "Lice L")
-            cx += d1 + 60
-            d2, _ = _draw_exact_circle(r_tex, DOT_DIAM_MM, cx, dot_y, "Lice P")
+            # Z tvojho anatomického pohľadu: right_dot = pod tvoje ľavé oko, left_dot = pod tvoje pravé oko
+            if r_tex is not None:
+                d1, _ = _draw_exact_circle(r_tex, "right_dot", eff_dot_diam_mm, cx, dot_y, "Tvoje LAVE lice")
+                cx += d1 + 75
+            if l_tex is not None:
+                d2, _ = _draw_exact_circle(l_tex, "left_dot", eff_dot_diam_mm, cx, dot_y, "Tvoje PRAVE lice")
+                cx += d2 + 75
+            if c_tex is not None:
+                _draw_exact_circle(c_tex, "chin_dot", eff_dot_diam_mm, cx, dot_y, "Tvoja BRADA")
     else:
-        # Fallback pre iba-bodkové konštelácie
-        cx, cy = 100, 260
+        cx, cy = 100, 280
         for it in items:
-            _draw_exact_circle(it["rgb"], DOT_DIAM_MM, cx, cy, it["key"])
-            cx += int(round((DOT_DIAM_MM + 10.0) * MM_TO_PX))
+            _draw_exact_circle(it["rgb"], "", eff_dot_diam_mm, cx, cy, it["key"])
+            cx += int(round((eff_dot_diam_mm + 10.0) * MM_TO_PX))
 
+    sheet_bgr = cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR)
     if output_path:
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        cv2.imwrite(output_path, sheet)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            cv2.imwrite(output_path, sheet_bgr)
+        except Exception:
+            pass
 
-    # Vždy ulož aj do workspace zložky printable_patches/
     ws_copy = "printable_patches/printable_patch_sheet_last.png"
     try:
         os.makedirs("printable_patches", exist_ok=True)
-        cv2.imwrite(ws_copy, sheet)
+        cv2.imwrite(ws_copy, sheet_bgr)
     except Exception:
         pass
 
-    # Pozor: "medzivýpočet" je interný render; na hárku sa kreslia PRESNÉ reálne rozmery.
     print("[PRINTABLE] mm_per_px=%.4f sheet=%.1fx%.1fmm | vykreslené: páska=%.1fx%.1fmm "
           "(stred %.1fmm), nálepky=%.1fmm kruhy | medzivýpočet: %s"
-          % (mm_per_px, sheet_w_mm, sheet_h_mm, STRIP_LEN_MM, STRIP_WINGS_MM, STRIP_WAIST_MM,
-             DOT_DIAM_MM,
+          % (mm_per_px, sheet_w_mm, sheet_h_mm, eff_strip_len_mm, eff_strip_wings_mm, eff_strip_waist_mm,
+             eff_dot_diam_mm,
              " ".join("%s=%.2fx%.2fmm" % (it["key"], it["mm_w"], it["mm_h"]) for it in items)))
 
     return sheet
@@ -910,7 +1007,8 @@ def build_printable_payload(boxes: dict, spec_items: dict, mm_per_px: float):
     spec_items: {key: (box, tex_size)} kde box=(y1,y2,x1,x2), tex_size=(H,W).
     Zabezpečuje rovnakú fyzickú mierku (mm) a alpha obrys pre každý nosič.
     """
-    r_dot_eff = float(boxes.get("dot_radius_eff", 4.5))
+    r_dot_eff = float(boxes.get("dot_radius_eff", 5.5))
+    strip_w_scale = float(boxes.get("strip_w_scale", 1.15))
     strip_angle = float(boxes.get("strip_angle", 0.0))
     cos_by_key = {
         "left_dot": float(boxes.get("foreshortening_left", 0.85)),
@@ -919,13 +1017,13 @@ def build_printable_payload(boxes: dict, spec_items: dict, mm_per_px: float):
     }
     mask_keys = {"strip": "strip_mask", "left_dot": "left_mask",
                  "right_dot": "right_mask", "chin_dot": "chin_mask"}
-    labels = {"strip": "1. Breathe Right páska na nos", "left_dot": "2. Ľavé líce",
-              "right_dot": "3. Pravé líce", "chin_dot": "4. Brada"}
+    labels = {"strip": "1. Breathe Right páska na nos", "right_dot": "2. Tvoje ĽAVÉ líce (pod ľavé oko)",
+              "left_dot": "3. Tvoje PRAVÉ líce (pod pravé oko)", "chin_dot": "4. Brada"}
     masks_np, geo = {}, {}
     for key, (box, tex_size) in spec_items.items():
         y1, y2, x1, x2 = box
-        if key == "strip" and "strip_flat_mask" in boxes:
-            m = boxes["strip_flat_mask"]
+        if key == "strip" and "strip_mask" in boxes and "strip_flat_mask" in boxes:
+            m = torch.maximum(boxes["strip_mask"], boxes["strip_flat_mask"])
         else:
             m = boxes.get(mask_keys.get(key))
         if m is not None:
@@ -933,18 +1031,149 @@ def build_printable_payload(boxes: dict, spec_items: dict, mm_per_px: float):
         if key == "strip":
             geo[key] = {"mm_w": (x2 - x1) * mm_per_px * 1.14, "mm_h": (y2 - y1) * mm_per_px,
                         "unsquash": 1.14, "rotate_deg": -math.degrees(strip_angle),
+                        "strip_w_scale": strip_w_scale,
                         "label": labels[key]}
         else:
             geo[key] = {"mm_w": 2.0 * r_dot_eff * mm_per_px, "mm_h": 2.0 * r_dot_eff * mm_per_px,
                         "unsquash": 1.0 / max(0.45, cos_by_key.get(key, 0.85)),
-                        "rotate_deg": 0.0, "label": labels[key]}
+                        "rotate_deg": 0.0,
+                        "dot_radius_eff": r_dot_eff,
+                        "label": labels[key]}
             dg = (boxes.get("dot_geom") or {}).get(key)
             if dg is not None:
-                # Presné údaje na "rozbalenie" nálepky: stred, cos sklonu, os sklonu,
-                # box textury. generate_printable_sheet z toho vyrenderuje čistý kruh.
                 geo[key]["flat"] = {"cx": dg[0], "cy": dg[1], "cos": dg[2], "tilt": dg[3],
                                     "r": r_dot_eff, "box": tuple(box), "tex": tuple(tex_size)}
     return masks_np, geo
+
+
+def generate_emblem_masks(
+    th_s: int = TEX_STRIP_SIZE[0],
+    tw_s: int = TEX_STRIP_SIZE[1],
+    th_d: int = TEX_DOT_SIZE[0],
+    tw_d: int = TEX_DOT_SIZE[1],
+    style: str = "chevron_stars",
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """
+    Vygeneruje ostro vyhladené (4x supersampled) vektorové masky loga pre nosnú pásku
+    (th_s, tw_s) a nálepky na líca/bradu (th_d, tw_d).
+    Rozmery sú striktne vnútri aktívnej oblasti masky (zúžený stred pásky +-14 px,
+    aktívny kruh nálepky r~25 px), takže logo sa nikdy neořeže a zaberá < 10 % plochy,
+    čím zachováva > 90 % plnej adversariálnej kapacity pozadia.
+    """
+    s_lower = str(style).lower()
+    if any(k in s_lower for k in ["vypnut", "bez_loga", "čistá", "clean", "none", "bez loga"]):
+        return None, None
+
+    ss = 4
+    strip_emblem = None
+    dot_emblem = None
+
+    # 1. Nosná páska: kompaktný dvojitý športový chevron (ukazuje HORE) alebo lekárenský krížik
+    hs_hi, ws_hi = th_s * ss, tw_s * ss
+    cx_s, cy_s = ws_hi // 2, hs_hi // 2
+    canvas_s = np.zeros((hs_hi, ws_hi), dtype=np.uint8)
+
+    if any(k in s_lower for k in ["chevron", "karbón", "carbon", "sport", "šport", "breathe", "plné", "dynamick", "rgb", "star", "hviez"]):
+        # Horný hlavný športový chevron ^ (výška v 1x: [-8.5, +1.5] px -> bezpečne v zúženom páse)
+        p_top = np.array([
+            [cx_s, cy_s - int(8.5 * ss)],
+            [cx_s + int(17.5 * ss), cy_s + int(1.0 * ss)],
+            [cx_s + int(14.5 * ss), cy_s + int(3.5 * ss)],
+            [cx_s, cy_s - int(4.3 * ss)],
+            [cx_s - int(14.5 * ss), cy_s + int(3.5 * ss)],
+            [cx_s - int(17.5 * ss), cy_s + int(1.0 * ss)],
+        ], dtype=np.int32)
+        # Dolný akcentový chevron ^ (výška v 1x: [-0.5, +7.5] px)
+        p_bot = np.array([
+            [cx_s, cy_s - int(0.8 * ss)],
+            [cx_s + int(11.5 * ss), cy_s + int(5.5 * ss)],
+            [cx_s + int(8.8 * ss), cy_s + int(7.8 * ss)],
+            [cx_s, cy_s + int(3.0 * ss)],
+            [cx_s - int(8.8 * ss), cy_s + int(7.8 * ss)],
+            [cx_s - int(11.5 * ss), cy_s + int(5.5 * ss)],
+        ], dtype=np.int32)
+        cv2.fillPoly(canvas_s, [p_top, p_bot], 255, lineType=cv2.LINE_AA)
+        strip_emblem = cv2.resize(canvas_s, (tw_s, th_s), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    elif any(k in s_lower for k in ["kríž", "cross", "telov", "tan", "medic"]):
+        cv2.rectangle(canvas_s, (cx_s - int(2.8 * ss), cy_s - int(8.2 * ss)), (cx_s + int(2.8 * ss), cy_s + int(8.2 * ss)), 255, -1)
+        cv2.rectangle(canvas_s, (cx_s - int(8.5 * ss), cy_s - int(2.8 * ss)), (cx_s + int(8.5 * ss), cy_s + int(2.8 * ss)), 255, -1)
+        strip_emblem = cv2.resize(canvas_s, (tw_s, th_s), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+
+    # 2. Nálepky na líca/bradu: geometrická 5-cípa Starface hviezda (r_out=11.0 px v 96x96) alebo krížik
+    hd_hi, wd_hi = th_d * ss, tw_d * ss
+    cx_d, cy_d = wd_hi // 2, hd_hi // 2
+    canvas_d = np.zeros((hd_hi, wd_hi), dtype=np.uint8)
+
+    if any(k in s_lower for k in ["star", "hviez", "chevron", "karbón", "carbon", "sport", "šport", "breathe", "plné", "dynamick", "rgb"]):
+        r_out = 11.0 * ss
+        r_in = 4.6 * ss
+        star_pts = []
+        for k in range(10):
+            ang = -math.pi / 2.0 + k * (math.pi / 5.0)
+            rad = r_out if (k % 2 == 0) else r_in
+            star_pts.append([int(round(cx_d + rad * math.cos(ang))), int(round(cy_d + rad * math.sin(ang)))])
+        cv2.fillPoly(canvas_d, [np.array(star_pts, dtype=np.int32)], 255, lineType=cv2.LINE_AA)
+        dot_emblem = cv2.resize(canvas_d, (tw_d, th_d), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+    elif any(k in s_lower for k in ["kríž", "cross", "telov", "tan", "medic"]):
+        cv2.rectangle(canvas_d, (cx_d - int(2.4 * ss), cy_d - int(7.2 * ss)), (cx_d + int(2.4 * ss), cy_d + int(7.2 * ss)), 255, -1)
+        cv2.rectangle(canvas_d, (cx_d - int(7.2 * ss), cy_d - int(2.4 * ss)), (cx_d + int(7.2 * ss), cy_d + int(2.4 * ss)), 255, -1)
+        dot_emblem = cv2.resize(canvas_d, (tw_d, th_d), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+
+    return strip_emblem, dot_emblem
+
+
+def apply_logo_emblem(
+    tex: torch.Tensor,
+    key: str,
+    logo_mask,
+    strip_style: str = "athlete_black",
+    is_rgb: bool = False,
+) -> torch.Tensor:
+    """
+    Vykreslí ostrý emblém (chevron / hviezdičku / krížik) priamo do centrálnych ~5-10 %
+    textúry BEZ akéhokoľvek tlmenia zvyšných ~90-95 % adversariálneho pozadia (m == 0 -> 1.0 * tex).
+    """
+    if logo_mask is None:
+        return tex
+    m_raw = None
+    if isinstance(logo_mask, dict):
+        m_raw = logo_mask.get(key)
+        if m_raw is None:
+            m_raw = logo_mask.get("strip" if key == "strip" else "dot")
+    elif key == "strip":
+        m_raw = logo_mask
+    if m_raw is None:
+        return tex
+
+    device = tex.device
+    m = m_raw.to(device) if isinstance(m_raw, torch.Tensor) else torch.tensor(m_raw, dtype=torch.float32, device=device)
+    if m.dim() == 2:
+        m = m.view(1, 1, *m.shape[-2:])
+    elif m.dim() == 3:
+        m = m.view(1, *m.shape)
+    m = F.interpolate(m.float(), size=tex.shape[-2:], mode="bilinear", align_corners=False).clamp(0.0, 1.0)
+
+    style_l = str(strip_style).lower()
+    if is_rgb:
+        # Kontrastný tmavý obrys (halo) + čisto biele jadro, aby logo svietilo na akejkoľvek RGB farbe
+        m_dil = F.max_pool2d(m, kernel_size=5, stride=1, padding=2)
+        ring = (m_dil - m).clamp(0.0, 1.0)
+        halo_col = torch.tensor([-0.86, -0.86, -0.88], device=device).view(1, 3, 1, 1)
+        fill_col = torch.clamp(torch.tensor([0.94, 0.95, 0.97], device=device).view(1, 3, 1, 1) + 0.06 * tex, -1.0, 1.0)
+        tex = tex * (1.0 - 0.88 * ring) + halo_col * (0.88 * ring)
+        tex = tex * (1.0 - 0.92 * m) + fill_col * (0.92 * m)
+    elif "tan" in style_l:
+        m_dil = F.max_pool2d(m, kernel_size=3, stride=1, padding=1)
+        ring = (m_dil - m).clamp(0.0, 1.0)
+        halo_col = torch.tensor([0.94, 0.94, 0.94], device=device).view(1, 3, 1, 1)
+        fill_col = torch.clamp(torch.tensor([0.74, -0.58, -0.58], device=device).view(1, 3, 1, 1) + 0.06 * tex, -1.0, 1.0)
+        tex = tex * (1.0 - 0.80 * ring) + halo_col * (0.80 * ring)
+        tex = tex * (1.0 - 0.90 * m) + fill_col * (0.90 * m)
+    else:
+        # Tmavý karbón / čierna športová páska -> ostrý strieborno-biely emblém
+        fill_col = torch.clamp(torch.tensor([0.86, 0.88, 0.92], device=device).view(1, 3, 1, 1) + 0.08 * tex, -1.0, 1.0)
+        tex = tex * (1.0 - 0.90 * m) + fill_col * (0.90 * m)
+    return tex
 
 
 def hybrid_patch_attack(
@@ -1060,41 +1289,36 @@ def hybrid_patch_attack(
         x_grid = torch.arange(tw_t, device=device).view(1, -1)
         u = (x_grid / float(tw_t)) * 20.0
         v = (y_grid / float(th_t)) * 6.0
-        carbon_pattern = (0.09 * torch.sin((u + v) * 2.5) * torch.cos((u - v) * 2.5)).view(1, 1, th_t, tw_t)
-        base_strip = torch.tensor([-0.65, -0.65, -0.65], device=device).view(1, 3, 1, 1) + carbon_pattern
-        base_dots = torch.tensor([0.68, 0.45, 0.22], device=device).view(1, 3, 1, 1)
-        delta_scale_strip = 0.70
-        delta_scale_dots = 0.50
+        carbon_pattern = (0.08 * torch.sin((u + v) * 2.5) * torch.cos((u - v) * 2.5)).view(1, 1, th_t, tw_t)
+        base_strip = torch.tensor([-0.52, -0.52, -0.50], device=device).view(1, 3, 1, 1) + carbon_pattern
+        base_dots = torch.tensor([-0.50, -0.50, -0.48], device=device).view(1, 3, 1, 1)
+        delta_scale_strip = 0.65
+        delta_scale_dots = 0.65
     elif strip_style == "tan_fabric":
-        base_strip = torch.tensor([0.65, 0.44, 0.25], device=device).view(1, 3, 1, 1)
-        base_dots = torch.tensor([0.68, 0.45, 0.22], device=device).view(1, 3, 1, 1)
-        delta_scale_strip = 0.70
-        delta_scale_dots = 0.50
+        base_strip = torch.tensor([0.55, 0.36, 0.18], device=device).view(1, 3, 1, 1)
+        base_dots = torch.tensor([0.58, 0.38, 0.20], device=device).view(1, 3, 1, 1)
+        delta_scale_strip = 0.65
+        delta_scale_dots = 0.55
     elif strip_style in ["clear_silicone", "clear"]:
         base_strip = torch.tensor([0.45, 0.45, 0.48], device=device).view(1, 3, 1, 1)
-        base_dots = torch.tensor([0.68, 0.45, 0.22], device=device).view(1, 3, 1, 1)
+        base_dots = torch.tensor([0.58, 0.38, 0.20], device=device).view(1, 3, 1, 1)
         delta_scale_strip = 0.50
         delta_scale_dots = 0.50
     else:
-        # Čierna športová
-        base_strip = torch.tensor([-0.72, -0.72, -0.72], device=device).view(1, 3, 1, 1)
-        base_dots = torch.tensor([0.68, 0.45, 0.22], device=device).view(1, 3, 1, 1)
-        delta_scale_strip = 0.70
-        delta_scale_dots = 0.50
+        # Čierna športová páska + čierne športové nálepky
+        base_strip = torch.tensor([-0.54, -0.54, -0.52], device=device).view(1, 3, 1, 1)
+        base_dots = torch.tensor([-0.52, -0.52, -0.50], device=device).view(1, 3, 1, 1)
+        delta_scale_strip = 0.65
+        delta_scale_dots = 0.65
 
     # --- Vrstva: paleta (logo) + voliteľná šablóna tvaru ---
     def _prep_tex(tex, key):
+        if not is_rgb and strip_style not in ["tan_fabric", "clear_silicone", "clear"]:
+            tex = torch.clamp(tex, -0.98, 0.14)
         if palette_t is not None:
             tex = _quantize_to_palette(tex, palette_t)
         if logo_mask is not None:
-            m = logo_mask
-            if m.dim() == 2:
-                m = m.view(1, 1, *m.shape[-2:])
-            elif m.dim() == 3:
-                m = m.view(1, *m.shape)
-            m = F.interpolate(m.float(), size=tex.shape[-2:], mode="nearest")
-            base_c = base_strip if key == "strip" else base_dots
-            tex = tex * m + base_c.expand_as(tex) * (1.0 - m)
+            tex = apply_logo_emblem(tex, key, logo_mask, strip_style=strip_style, is_rgb=is_rgb)
         return tex
 
     # --- Optimalizované textúry vo VLASTNOM vysokom rozlíšení (žiadne ~20x6 px) ---
@@ -1257,51 +1481,9 @@ def hybrid_patch_attack(
             orig_sim = 1.0
             success = final_sim < 0.5
 
-    # patches_dict obsahuje PRESNE to, čo model dostal: vysokorozlíšenú zloženú podobu
-    # patcha (rovnaké light_mult/osvetlenie, rovnaký reliéf, rovnaká priehľadnosť),
-    # ktorej diferencovateľný downsample je vstupom modelu. Čo sa vytlačí = čo sa optimalizovalo.
-    patches_dict = {key: comp.squeeze(0).cpu() for key, comp in final_comps.items()}
-
-    masks_np = {}
-    mask_keys = {"strip": "strip_mask", "left_dot": "left_mask",
-                 "right_dot": "right_mask", "chin_dot": "chin_mask"}
-    for key, (_, box, tex_size) in final_specs.items():
-        m = boxes.get(mask_keys[key])
-        if m is not None:
-            masks_np[key] = _region_field(m.to(device), box, tex_size[0], tex_size[1]).squeeze().cpu().numpy()
-
-    geo = {
-        "strip": {
-            "mm_w": (sx2 - sx1) * mm_per_px,
-            "mm_h": (sy2 - sy1) * mm_per_px,
-            "unsquash": 1.0,
-            "rotate_deg": -math.degrees(strip_angle),
-            "label": "1. Breathe Right paska na nos",
-        },
-        "left_dot": {
-            "mm_w": 2.0 * r_dot_eff * mm_per_px,
-            "mm_h": 2.0 * r_dot_eff * mm_per_px,
-            "unsquash": 1.0 / max(0.45, cos_left),
-            "rotate_deg": 0.0,
-            "label": "2. Lave lice",
-        },
-    }
-    if has_right:
-        geo["right_dot"] = {
-            "mm_w": 2.0 * r_dot_eff * mm_per_px,
-            "mm_h": 2.0 * r_dot_eff * mm_per_px,
-            "unsquash": 1.0 / max(0.45, cos_right),
-            "rotate_deg": 0.0,
-            "label": "3. Prave lice",
-        }
-    if has_chin:
-        geo["chin_dot"] = {
-            "mm_w": 2.0 * r_dot_eff * mm_per_px,
-            "mm_h": 2.0 * r_dot_eff * mm_per_px,
-            "unsquash": 1.0 / max(0.45, cos_chin),
-            "rotate_deg": 0.0,
-            "label": "4. Brada",
-        }
+    patches_dict = {key: spec[0].squeeze(0).detach().cpu() for key, spec in final_specs.items()}
+    spec_items = {key: (spec[1], spec[2]) for key, spec in final_specs.items()}
+    masks_np, geo = build_printable_payload(boxes, spec_items, mm_per_px)
 
     printable_sheet = generate_printable_sheet(
         patches_dict,
