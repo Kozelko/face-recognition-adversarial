@@ -8,6 +8,8 @@ if "cnn-benchmark" not in sys.executable and os.path.exists(_CONDA_PY):
 import math
 import json
 import base64
+import csv
+from datetime import datetime
 
 # Automatické nastavenie pracovného adresára na koreň projektu
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +42,7 @@ from attacks.mifgsm import mifgsm_attack_untargeted
 from attacks.cw import cw_l2_attack_untargeted
 from attacks.adversarial_patch import adversarial_patch_attack, get_patch_geometry
 from attacks.constellation_patch import constellation_patch_attack, create_elliptical_patch_mask, get_anatomical_patch_specs, extract_landmarks, get_surface_geometry_at_coords
-from attacks.hybrid_patch import hybrid_patch_attack, get_hybrid_geometry
+from attacks.hybrid_patch import hybrid_patch_attack, get_hybrid_geometry, generate_emblem_masks
 from attacks.ensemble_hybrid_patch import ensemble_hybrid_patch_attack
 from attacks.nasal_strip_patch import nasal_strip_attack, generate_printable_nasal_strip_sheet, create_nasal_strip_mask, compute_nasal_strip_placement
 from models.pad_minifasnet import load_pad_model
@@ -123,8 +125,33 @@ init_models()
 
 # Identifikácia osôb a registrácia galérie
 gallery_cache = {}
+GALLERY_CACHE_FILE = os.path.join(PROJECT_ROOT, "data", "gallery_centroids.pt")
 
-def get_model_gallery(model, model_name):
+def load_disk_gallery_cache():
+    if os.path.exists(GALLERY_CACHE_FILE):
+        try:
+            saved = torch.load(GALLERY_CACHE_FILE, map_location="cpu")
+            if isinstance(saved, dict) and len(saved) > 0:
+                for k, v in saved.items():
+                    gallery_cache[k] = {p: cent.to(DEVICE) for p, cent in v.items()}
+                print(f"✅ Galéria centroidov načítaná z disku: {list(gallery_cache.keys())}")
+                return True
+        except Exception as e:
+            print(f"⚠️ Nepodarilo sa načítať cache galérie z disku: {e}")
+    return False
+
+def save_disk_gallery_cache():
+    try:
+        to_save = {}
+        for k, v in gallery_cache.items():
+            to_save[k] = {p: cent.cpu() for p, cent in v.items()}
+        os.makedirs(os.path.dirname(GALLERY_CACHE_FILE), exist_ok=True)
+        torch.save(to_save, GALLERY_CACHE_FILE)
+        print(f"💾 Galéria centroidov uložená na disk: {GALLERY_CACHE_FILE}")
+    except Exception as e:
+        print(f"⚠️ Nepodarilo sa uložiť cache galérie na disk: {e}")
+
+def get_model_gallery(model, model_name, persist=True):
     if model_name in gallery_cache:
         return gallery_cache[model_name]
     
@@ -158,7 +185,20 @@ def get_model_gallery(model, model_name):
                     cent = F.normalize(torch.cat(embs, dim=0).mean(dim=0, keepdim=True), p=2, dim=1)
                     gallery[person] = cent
     gallery_cache[model_name] = gallery
+    if persist:
+        save_disk_gallery_cache()
     return gallery
+
+def warmup_all_galleries():
+    if not load_disk_gallery_cache():
+        print("⏳ Pre-warmujem galérie modelov...")
+        for m_name, m_obj in models_dict.items():
+            if m_obj is not None:
+                get_model_gallery(m_obj, m_name, persist=False)
+        save_disk_gallery_cache()
+
+# Okamžité načítanie alebo zahriatie galérií pri štarte aplikácie
+warmup_all_galleries()
 
 def get_dataset_classes():
     if not os.path.exists(DATASET_DIR):
@@ -271,11 +311,11 @@ def crop_face_from_image(pil_img):
         t = torch.from_numpy(arr).permute(2, 0, 1).to(DEVICE)
         return t, "Pôvodný 112×112 px výrez"
 
-    # Pre webkamera zábery s vysokým rozlíšením (napr. 1080p) normalizujeme mierku
+    # Pre veľmi veľké fotky z mobilu (>1280px) normalizujeme mierku, 720p HD (1280×720) necháme v plnej ostrosti!
     proc_img = pil_img
     max_dim = max(w, h)
-    if max_dim > 720:
-        scale = 720.0 / max_dim
+    if max_dim > 1280:
+        scale = 1280.0 / max_dim
         new_w, new_h = max(112, int(w * scale)), max(112, int(h * scale))
         proc_img = pil_img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
@@ -364,17 +404,84 @@ def get_face_tensor_from_image(image):
         t = t.unsqueeze(0)
     return t.to(DEVICE), method, None
 
+EVAL_CAPTURES_DIR = os.path.join(PROJECT_ROOT, "data", "eval_captures")
+EVAL_RESULTS_CSV = os.path.join(PROJECT_ROOT, "data", "eval_results.csv")
+
+def log_evaluation_result(image_pil, target_model, ensemble_mode, all_results, p_live, method):
+    """Automatické ukladanie každej testovacej fotky + zápis výsledkov všetkých modelov do CSV."""
+    try:
+        os.makedirs(EVAL_CAPTURES_DIR, exist_ok=True)
+        now = datetime.now()
+        ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        file_ts = now.strftime("%Y%m%d_%H%M%S_%f")
+        img_filename = f"capture_{file_ts}.jpg"
+        img_path = os.path.join(EVAL_CAPTURES_DIR, img_filename)
+        
+        # Uložíme fotku v plnej kvalite
+        image_pil.save(img_path, quality=95)
+        
+        csv_exists = os.path.exists(EVAL_RESULTS_CSV)
+        with open(EVAL_RESULTS_CSV, mode="a", newline="", encoding="utf-8") as csv_file:
+            fieldnames = [
+                "Timestamp", "Image_File", "Target_Model", "Ensemble_Mode", "Face_Detector",
+                "FaceNet_Sim", "FaceNet_CASIA_Sim", "ArcFace_Sim", "AdaFace_Sim",
+                "BenchmarkCNN_Sim", "BenchmarkCNN_Finetuned_Sim", "BenchmarkCNN_Clf",
+                "PAD_Live_Pct", "PAD_Verdict", "Evaded_ArcFace", "Evaded_AdaFace", "Evaded_BenchmarkCNN"
+            ]
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            if not csv_exists:
+                writer.writeheader()
+                
+            pad_pct = round(p_live * 100.0, 1) if p_live is not None else 0.0
+            pad_verdict = ("LIVE" if p_live >= 0.5 else "SPOOF") if p_live is not None else "N/A"
+            
+            fn_sim = all_results.get("FaceNet", {}).get("sim", 0.0)
+            fnc_sim = all_results.get("FaceNet (CASIA)", {}).get("sim", 0.0)
+            arc_sim = all_results.get("ArcFace", {}).get("sim", 0.0)
+            ada_sim = all_results.get("AdaFace", {}).get("sim", 0.0)
+            bcnn_sim = all_results.get("BenchmarkCNN", {}).get("sim", 0.0)
+            bcnn_ft = all_results.get("BenchmarkCNN (Finetuned)", {})
+            bcnn_ft_sim = bcnn_ft.get("sim", 0.0)
+            bcnn_clf = bcnn_ft.get("clf_short", "")
+            
+            writer.writerow({
+                "Timestamp": ts_str,
+                "Image_File": img_path,
+                "Target_Model": str(target_model),
+                "Ensemble_Mode": str(ensemble_mode),
+                "Face_Detector": str(method),
+                "FaceNet_Sim": f"{fn_sim:.4f}",
+                "FaceNet_CASIA_Sim": f"{fnc_sim:.4f}",
+                "ArcFace_Sim": f"{arc_sim:.4f}",
+                "AdaFace_Sim": f"{ada_sim:.4f}",
+                "BenchmarkCNN_Sim": f"{bcnn_sim:.4f}",
+                "BenchmarkCNN_Finetuned_Sim": f"{bcnn_ft_sim:.4f}",
+                "BenchmarkCNN_Clf": bcnn_clf,
+                "PAD_Live_Pct": f"{pad_pct:.1f}",
+                "PAD_Verdict": pad_verdict,
+                "Evaded_ArcFace": "ÁNO" if arc_sim < 0.50 else "NIE",
+                "Evaded_AdaFace": "ÁNO" if ada_sim < 0.50 else "NIE",
+                "Evaded_BenchmarkCNN": "ÁNO" if bcnn_sim < 0.50 else "NIE",
+            })
+        return img_path
+    except Exception as e:
+        print(f"⚠️ Chyba pri zápise do eval logu: {e}")
+        return None
+
 def run_identify(image, model_name, ensemble_mode=""):
     if image is None:
-        return None, None, None, "Nahrajte alebo odfoťte fotku.", "", ""
+        msg = "⚠️ Žiadna odfotená fotka. Najprv stlač spúšť pod webkamerou (ikona fotoaparátu) alebo nahraj súbor."
+        return None, None, None, msg, msg, msg
     
-    img_tensor, method, err_msg = get_face_tensor_from_image(image)
+    pil_img = to_pil_image(image)
+    img_tensor, method, err_msg = get_face_tensor_from_image(pil_img)
     if img_tensor is None:
-        return None, None, None, err_msg, "", ""
+        return None, None, None, err_msg, err_msg, err_msg
 
     model = models_dict.get(model_name)
     if model is None:
-        return None, None, None, f"Model {model_name} nie je dostupný.", "", ""
+        m_err = f"Model {model_name} nie je dostupný."
+        return None, None, None, m_err, m_err, m_err
         
     clean_id = predict_person_identity(model, model_name, img_tensor, is_attack=False)
     face_np = (denormalize(img_tensor).squeeze().permute(1, 2, 0).cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
@@ -389,22 +496,56 @@ def run_identify(image, model_name, ensemble_mode=""):
     elif "Ensemble" in str(ensemble_mode) or "Black-Box" in str(ensemble_mode):
         status += f" | Režim: Black-Box cieľ ({model_name})"
         holdout_model_name = model_name
+        
+    p_live = None
     if pad_detector is not None:
         with torch.no_grad():
             p_live = float(pad_detector(img_tensor).mean().item())
         pad_verdict = "ŽIVÁ TVÁR (LIVE)" if p_live >= 0.5 else "PODVRH (SPOOF)"
         status += f"\nPAD Liveness (MiniFASNetV2): P(live) = {p_live * 100.0:.1f} % -> {pad_verdict}"
 
-    # Prehľad všetkých modelov pre rýchle overenie vytlačeného útoku pred kamerou
+    # Prehľad všetkých modelov vrátane tvojho BenchmarkCNN
+    all_results = {}
     cross_lines = ["Prehľad všetkých modelov (pre test vytlačených nálepiek pred kamerou):"]
     for m_name, m_obj in models_dict.items():
         if m_obj is None:
             continue
-        id_lines = predict_person_identity(m_obj, m_name, img_tensor, is_attack=False).splitlines()
-        summary_line = id_lines[1] if len(id_lines) > 1 else id_lines[0]
+        gallery = get_model_gallery(m_obj, m_name)
+        best_sim = -1.0
+        best_person = "Neznámy"
+        with torch.no_grad():
+            emb = m_obj(img_tensor)
+            for person, cent in gallery.items():
+                sim = F.cosine_similarity(emb, cent).item()
+                if sim > best_sim:
+                    best_sim = sim
+                    best_person = format_display_name(person)
+        
+        clf_info = ""
+        clf_short = ""
+        if hasattr(m_obj, "predict_identity"):
+            clf = m_obj.predict_identity(img_tensor)
+            if clf:
+                clf_info = f" [Klasifikátor: {format_short_name(clf['raw_label'])} {clf['confidence']*100.0:.0f} %]"
+                clf_short = f"{format_short_name(clf['raw_label'])} ({clf['confidence']*100.0:.0f} %)"
+
+        all_results[m_name] = {
+            "sim": best_sim,
+            "person": best_person,
+            "clf": clf_info,
+            "clf_short": clf_short
+        }
         tag = " 🎯 [BLACK-BOX]" if m_name == holdout_model_name else ""
-        cross_lines.append(f"• {m_name}{tag}: {summary_line}")
+        verdict = "nerozpoznaný (pod 0.50)" if best_sim < 0.50 else "rozpoznaný"
+        is_user_model = "BenchmarkCNN" in m_name
+        model_label = f"{m_name} (Tvoj model)" if is_user_model else f"{m_name}"
+        cross_lines.append(f"• {model_label}{tag}: {best_person}, podobnosť {best_sim:.4f}{clf_info} -> {verdict}")
+        
     adv_id = "\n".join(cross_lines)
+    
+    saved_img = log_evaluation_result(pil_img, model_name, ensemble_mode, all_results, p_live, method)
+    if saved_img:
+        status += f"\n💾 Uložené: {os.path.basename(saved_img)} do data/eval_captures/ a zapísané v data/eval_results.csv"
     
     return face_np, face_np, None, clean_id, adv_id, status
 
@@ -518,8 +659,94 @@ HEAD_SCRIPTS = """
 body.webcam-flip-video video {
     transform: scaleX(-1) !important;
 }
+/* Monitor Softbox / Selfie Ring Light prisvietenie */
+body.screen-softbox-active {
+    background: #ffffff !important;
+    background-color: #ffffff !important;
+}
+body.screen-softbox-active .gradio-container {
+    background: #ffffff !important;
+    background-color: #ffffff !important;
+}
+body.screen-softbox-active #tab1_webcam_box,
+body.screen-softbox-active #collect_webcam_box {
+    position: relative !important;
+    z-index: 99999 !important;
+    box-shadow: 0 0 0 100vmax #ffffff, 0 12px 48px rgba(0, 0, 0, 0.22) !important;
+    border-radius: 12px !important;
+}
+body.screen-softbox-active #tab1_photo_preview,
+body.screen-softbox-active #tab1_photo_preview * {
+    position: relative !important;
+    z-index: 100001 !important;
+}
+body.screen-softbox-active .softbox-indicator-badge {
+    display: block !important;
+}
+.softbox-indicator-badge {
+    display: none;
+    position: fixed;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #111111;
+    color: #ffffff;
+    padding: 8px 20px;
+    border-radius: 9999px;
+    font-size: 13px;
+    font-weight: 600;
+    z-index: 100000;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.18);
+    pointer-events: none;
+    letter-spacing: 0.3px;
+    font-family: sans-serif;
+}
 </style>
 <script>
+window.__toggleScreenSoftbox = function() {
+    const isNow = document.body.classList.toggle('screen-softbox-active');
+    let badge = document.getElementById('softbox-badge-el');
+    if (!badge) {
+        badge = document.createElement('div');
+        badge.id = 'softbox-badge-el';
+        badge.className = 'softbox-indicator-badge';
+        badge.innerText = '💡 Biele difúzne prisvietenie aktívne (Stlač ESC alebo tlačidlo pre zhasnutie)';
+        document.body.appendChild(badge);
+    }
+    const btns = document.querySelectorAll('.light-toggle-btn');
+    btns.forEach(b => {
+        b.innerText = isNow ? '💡 Vypnúť prisvietenie' : '💡 Prisvietenie tváre (Softbox)';
+    });
+    return isNow;
+};
+
+window.__turnOffScreenSoftbox = function() {
+    if (document.body.classList.contains('screen-softbox-active')) {
+        document.body.classList.remove('screen-softbox-active');
+        const badge = document.getElementById('softbox-badge-el');
+        if (badge) badge.remove();
+        const btns = document.querySelectorAll('.light-toggle-btn');
+        btns.forEach(b => {
+            b.innerText = '💡 Prisvietenie tváre (Softbox)';
+        });
+    }
+};
+
+document.addEventListener('click', function(e) {
+    const btn = e.target.closest('button');
+    if (btn && (btn.getAttribute('aria-label') === 'Snapshot' || btn.getAttribute('aria-label') === 'Capture' || (btn.querySelector('svg') && btn.closest('#tab1_webcam_box, #collect_webcam_box')))) {
+        setTimeout(function() {
+            if (window.__turnOffScreenSoftbox) window.__turnOffScreenSoftbox();
+        }, 300);
+    }
+});
+
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape' && document.body.classList.contains('screen-softbox-active')) {
+        window.__toggleScreenSoftbox();
+    }
+});
+
 window.__toggleWebcamFlip = function() {
     document.body.classList.toggle('webcam-flip-video');
     return document.body.classList.contains('webcam-flip-video');
@@ -1083,21 +1310,22 @@ def render_live_placement_preview(
             sr_np = strip_r.squeeze().cpu().numpy()
             strip_box_px = _mask_bbox_px(sm_np)
             strip_angle_deg = float(boxes.get("strip_angle", 0.0)) * 180.0 / math.pi
-            if "rgb" in str(patch_pos).lower() or "farebn" in str(patch_pos).lower() or "art" in str(patch_pos).lower():
+            p_low = str(patch_pos).lower()
+            if "rgb" in p_low or "farebn" in p_low or "art" in p_low:
                 s_col = np.array([235, 90, 50], dtype=np.float32)
-                d_col = np.array([245, 190, 40], dtype=np.float32)
-            elif "karbón" in str(patch_pos).lower() or "carbon" in str(patch_pos).lower():
-                s_col = np.array([38, 40, 44], dtype=np.float32)
-                d_col = np.array([220, 185, 145], dtype=np.float32)
-            elif "telová" in str(patch_pos).lower() or "tan" in str(patch_pos).lower():
+                d_col = np.array([60, 175, 245], dtype=np.float32)
+            elif "karbón" in p_low or "carbon" in p_low or "čierna" in p_low or "athlete" in p_low:
+                s_col = np.array([32, 34, 38], dtype=np.float32)
+                d_col = np.array([36, 38, 42], dtype=np.float32)
+            elif "telová" in p_low or "tan" in p_low:
                 s_col = np.array([210, 168, 125], dtype=np.float32)
                 d_col = np.array([220, 185, 145], dtype=np.float32)
-            elif "priesvitná" in str(patch_pos).lower() or "clear" in str(patch_pos).lower():
+            elif "priesvitná" in p_low or "clear" in p_low:
                 s_col = np.array([225, 225, 230], dtype=np.float32)
                 d_col = np.array([220, 185, 145], dtype=np.float32)
             else:
-                s_col = np.array([22, 22, 22], dtype=np.float32)
-                d_col = np.array([220, 185, 145], dtype=np.float32)
+                s_col = np.array([32, 34, 38], dtype=np.float32)
+                d_col = np.array([36, 38, 42], dtype=np.float32)
 
             for c in range(3):
                 canvas[:, :, c] = np.clip((1.0 - sm_np) * canvas[:, :, c] + sm_np * s_col[c] * sr_np, 0, 255).astype(np.uint8)
@@ -1207,11 +1435,11 @@ def render_ar_stream_frame(
             cv2.putText(out, "[N] NOS ^", (max(4, scx - 36), max(16, int(sy1 * scale) - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 229, 255), 2, cv2.LINE_AA)
 
-        # 2. Obrysy bodiek [L], [P], [B]
+        # 2. Obrysy bodiek [L], [P], [B] (anatomický pohľad: right_dot = tvoje ľavé líce, left_dot = tvoje pravé líce)
         dot_geom = boxes.get("dot_geom", {})
         dot_meta = [
-            ("left_dot", "[L] LAVE ^", (213, 0, 249)),
-            ("right_dot", "[P] PRAVE ^", (0, 230, 118)),
+            ("right_dot", "[L] TVOJE LAVE ^", (0, 230, 118)),
+            ("left_dot", "[P] TVOJE PRAVE ^", (213, 0, 249)),
             ("chin_dot", "[B] BRADA ^", (255, 145, 0)),
         ]
         for dkey, dlabel, dcol in dot_meta:
@@ -1410,36 +1638,56 @@ def run_attack(
         else:
             dot_pat = "2_cheeks"
 
-        style_str = str(patch_position)
-        chosen_strip_style = "athlete_black"
+        # Jediný zdroj pravdy: viditeľný selector patch_position (hybrid_style_mode iba ak je explicitne aktívny)
+        style_str = str(patch_position) if patch_position else str(hybrid_style_mode or "")
+        s_low = style_str.lower()
+        chosen_strip_style = "adversarial_rgb"
         chosen_palette = None
         chosen_logo_mask = None
 
-        if "Čierna" in style_str or "Athlete" in style_str:
-            chosen_strip_style = "athlete_black"
-        elif "Telová" in style_str or "Tan" in style_str:
-            chosen_strip_style = "tan_fabric"
-        elif "Priesvitná" in style_str or "Clear" in style_str:
-            chosen_strip_style = "clear_silicone"
-        elif "Karbón" in style_str or "Carbon" in style_str:
-            chosen_strip_style = "pro_carbon_logo"
-            chosen_palette = [[-1, -1, -1], [0.9, 0.1, 0.1]]
-        elif "Kinesio" in style_str:
-            chosen_strip_style = "athlete_black"
-            chosen_palette = [[-1, -1, -1], [0.7, 0.45, 0.25], [-0.6, -0.2, -0.9]]
-        elif "hviezda" in style_str.lower() or "starface" in style_str.lower():
-            chosen_strip_style = "athlete_black"
-            chosen_palette = [[-1, -1, -1], [0.9, 0.1, 0.1]]
-            _yy, _xx = np.mgrid[0:96, 0:96]
-            _ang = np.arctan2(_yy - 47.5, _xx - 47.5)
-            _rad = np.hypot(_xx - 47.5, _yy - 47.5)
-            chosen_logo_mask = torch.from_numpy(
-                ((_rad < 40) & (np.cos(5 * _ang) > 0.15)).astype(np.float32)
-            ).to(img_tensor.device)
-        elif "RGB" in style_str or "digitálny" in style_str or "farebn" in style_str.lower():
+        has_logo_kw = any(k in s_low for k in ("+ športové logo", "+ logo", "chevron", "hviezdičk", "starface", "breathe right & starface", "pro carbon logo"))
+        is_no_logo_kw = ("bez loga" in s_low)
+
+        if ("rgb" in s_low or "plnofarebn" in s_low or "digitáln" in s_low) and has_logo_kw and not is_no_logo_kw:
             chosen_strip_style = "adversarial_rgb"
-        else:
+            s_m, d_m = generate_emblem_masks(style="chevron_stars")
+            if s_m is not None and d_m is not None:
+                chosen_logo_mask = {
+                    "strip": torch.from_numpy(s_m).to(img_tensor.device),
+                    "dot": torch.from_numpy(d_m).to(img_tensor.device),
+                }
+        elif "rgb" in s_low or "plnofarebn" in s_low or "digitáln" in s_low or s_low.startswith("1."):
+            chosen_strip_style = "adversarial_rgb"
+            chosen_logo_mask = None
+        elif ("čierna" in s_low or "karbón" in s_low or "carbon" in s_low or "athlete" in s_low or s_low.startswith("4.")) and has_logo_kw and not is_no_logo_kw:
+            chosen_strip_style = "pro_carbon_logo"
+            s_m, d_m = generate_emblem_masks(style="chevron_stars")
+            if s_m is not None and d_m is not None:
+                chosen_logo_mask = {
+                    "strip": torch.from_numpy(s_m).to(img_tensor.device),
+                    "dot": torch.from_numpy(d_m).to(img_tensor.device),
+                }
+        elif "čierna" in s_low or "athlete" in s_low or s_low.startswith("2."):
             chosen_strip_style = "athlete_black"
+            chosen_logo_mask = None
+        elif "telová" in s_low or "kríž" in s_low or "tan" in s_low or s_low.startswith("5."):
+            chosen_strip_style = "tan_fabric"
+            if not is_no_logo_kw:
+                s_m, d_m = generate_emblem_masks(style="cross")
+                if s_m is not None and d_m is not None:
+                    chosen_logo_mask = {
+                        "strip": torch.from_numpy(s_m).to(img_tensor.device),
+                        "dot": torch.from_numpy(d_m).to(img_tensor.device),
+                    }
+        elif "priesvitn" in s_low or "clear" in s_low or s_low.startswith("6."):
+            chosen_strip_style = "clear_silicone"
+            chosen_logo_mask = None
+        elif "kinesio" in s_low:
+            chosen_strip_style = "athlete_black"
+            chosen_palette = [[-0.95, -0.95, -0.95], [0.70, 0.45, 0.25], [-0.60, -0.20, -0.90]]
+        else:
+            chosen_strip_style = "adversarial_rgb"
+            chosen_logo_mask = None
 
         s_w_scale = float(strip_scale) if strip_scale is not None else 1.0
         holdout_model_name = None
@@ -1454,18 +1702,36 @@ def run_attack(
                     for k in core_order
                     if k in models_dict and models_dict[k] is not None
                 }
+                if "BenchmarkCNN" in ens_models and "BenchmarkCNN (Finetuned)" in ens_models:
+                    ens_models.pop("BenchmarkCNN", None)
                 holdout_model_name = None
             else:
-                # Black-Box Leave-One-Out: trénuj na zvyšných, vynechaj model_name
+                # Black-Box Leave-One-Out: trénuj na zvyšných, vynechaj cieľový model (aj sesterský BenchmarkCNN variant)
+                excluded_set = {model_name}
+                if "BenchmarkCNN" in str(model_name):
+                    excluded_set.update({"BenchmarkCNN", "BenchmarkCNN (Finetuned)"})
                 ens_models = {
                     k: models_dict[k]
                     for k in core_order
-                    if k in models_dict and models_dict[k] is not None and k != model_name
+                    if k in models_dict and models_dict[k] is not None and k not in excluded_set
                 }
+                if "BenchmarkCNN" in ens_models and "BenchmarkCNN (Finetuned)" in ens_models:
+                    ens_models.pop("BenchmarkCNN", None)
                 holdout_model_name = model_name
 
             if not ens_models:
                 ens_models = {model_name: model}
+
+            bb_priors = None
+            if holdout_model_name is not None:
+                bb_priors = {
+                    "ArcFace": 2.25 if holdout_model_name == "AdaFace" else 1.45,
+                    "AdaFace": 2.25 if holdout_model_name == "ArcFace" else 1.55,
+                    "FaceNet": 2.10 if holdout_model_name == "FaceNet (CASIA)" else 1.55,
+                    "FaceNet (CASIA)": 2.10 if holdout_model_name == "FaceNet" else 1.30,
+                    "BenchmarkCNN": 1.25,
+                    "BenchmarkCNN (Finetuned)": 1.25,
+                }
 
             # Zistíme priradenú osobu v 1:N galérii a jej centroidy pre jednotlivé modely
             target_gallery = get_model_gallery(model, model_name)
@@ -1492,16 +1758,17 @@ def run_attack(
                 dot_pattern=dot_pat,
                 strip_w_scale=s_w_scale,
                 num_iter=h_iters,
-                lr=0.09,
+                lr=0.11,
                 eot=True,
                 grad_avg=False,
-                feature_weight=0.0,
-                input_diversity=False,
+                feature_weight=0.35 if holdout_model_name is not None else 0.28,
+                input_diversity=bool(holdout_model_name is not None),
                 multiscale=True,
                 ti_kernel=3,
                 pad_model=pad_detector,
-                pad_weight=0.20 if pad_detector is not None else 0.0,
+                pad_weight=3.20 if pad_detector is not None else 0.0,
                 gallery_centroids=g_cent if g_cent else None,
+                arch_priors=bb_priors,
                 palette=chosen_palette,
                 logo_mask=chosen_logo_mask,
                 mtcnn=mtcnn,
@@ -1695,6 +1962,11 @@ def save_image_to_dataset(image, person_name):
     
     # Premažeme cache galérie, aby nová fotka okamžite platila
     gallery_cache.clear()
+    try:
+        if os.path.exists(GALLERY_CACHE_FILE):
+            os.remove(GALLERY_CACHE_FILE)
+    except Exception:
+        pass
     
     count = len([f for f in os.listdir(person_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
     readable = format_display_name(person_name)
@@ -1704,6 +1976,11 @@ def save_image_to_dataset(image, person_name):
 
 def handle_finetune(progress=gr.Progress()):
     gallery_cache.clear()
+    try:
+        if os.path.exists(GALLERY_CACHE_FILE):
+            os.remove(GALLERY_CACHE_FILE)
+    except Exception:
+        pass
     success, msg = run_finetuning(dataset_dir=DATASET_DIR, epochs=15, lr=0.001, progress=progress)
     if success:
         # Skús znovu načítať nový model do pamäte
@@ -1757,18 +2034,20 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             scale=2
                         )
                         tab1_flip_cam_btn = gr.Button("↔️ Otočiť kameru L/P", variant="secondary", size="sm", scale=1)
+                        tab1_light_btn = gr.Button("💡 Prisvietenie tváre", variant="secondary", size="sm", scale=1, elem_classes=["light-toggle-btn"])
                         tab1_retake_btn = gr.Button("Odfoť znova", visible=False, variant="secondary", scale=1)
 
-                    tab1_webcam = gr.Image(
-                        sources=["webcam"],
-                        streaming=False,
-                        type="pil",
-                        format="jpeg",
-                        webcam_options=gr.WebcamOptions(mirror=False),
-                        label="Webkamera (namier tvár a stlač spúšť)",
-                        visible=True,
-                        height=210
-                    )
+                    with gr.Group(elem_id="tab1_webcam_box"):
+                        tab1_webcam = gr.Image(
+                            sources=["webcam"],
+                            streaming=False,
+                            type="pil",
+                            format="jpeg",
+                            webcam_options=gr.WebcamOptions(mirror=False, constraints={"video": {"width": {"ideal": 1920}, "height": {"ideal": 1080}}}),
+                            label="Webkamera (namier tvár a stlač spúšť)",
+                            visible=True,
+                            height=210
+                        )
 
                     tab1_upload = gr.Image(
                         sources=["upload"],
@@ -1785,7 +2064,8 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         label="Vybraná fotka",
                         interactive=False,
                         visible=False,
-                        height=210
+                        height=210,
+                        elem_id="tab1_photo_preview"
                     )
 
                     tab1_snap_msg = gr.Markdown(visible=False)
@@ -1850,19 +2130,20 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         visible=True,
                     )
 
+                    PROGRESSIVE_PATCH_STYLES = [
+                        "1. Plné RGB – Maximálna šanca (bez loga)",
+                        "2. Športová čierna páska – Vysoká šanca (bez loga)",
+                        "3. Plné RGB + Športové logo (chevron + hviezdičky)",
+                        "4. Športová čierna + Logo (Breathe Right & Starface)",
+                        "5. Telová náplasť + medicínsky krížik",
+                        "6. Priesvitná silikónová (Clear Silicone)",
+                    ]
+
                     with gr.Row():
                         patch_pos_dropdown = gr.Dropdown(
-                            choices=[
-                                "1. Čierna športová páska (Athlete Black - Breathe Right)",
-                                "2. Telová klasická (Tan Fabric - lekárenská)",
-                                "3. Priesvitná silikónová (Clear Silicone)",
-                                "4. Karbón s logom (Pro Carbon Logo)",
-                                "5. Kinesio páska (3 športové farby)",
-                                "6. Kozmetické hviezdičky (Starface Style)",
-                                "7. Neobmedzený digitálny vzor (Plné RGB)",
-                            ],
-                            value="1. Čierna športová páska (Athlete Black - Breathe Right)",
-                            label="Vzhľad a materiál náplastí (Materiál & Dizajn)",
+                            choices=PROGRESSIVE_PATCH_STYLES,
+                            value=PROGRESSIVE_PATCH_STYLES[0],
+                            label="Vzhľad a štýl náplastí (postupnosť od najvyššej šance)",
                             filterable=False,
                             elem_classes=["strict-select"],
                             visible=True
@@ -1918,15 +2199,9 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             visible=False
                         )
                         hybrid_style_dropdown = gr.Dropdown(
-                            choices=[
-                                "Vypnutá (plné RGB / podľa štýlu)",
-                                "Kinesio 3 farby",
-                                "Logo 2 farby (čierna/červená)",
-                                "Logo 4 farby",
-                                "Logo: hviezda (2 farby)",
-                            ],
-                            value="Vypnutá (plné RGB / podľa štýlu)",
-                            label="Režim vzoru (paleta / logo)",
+                            choices=["Vypnutá"] + PROGRESSIVE_PATCH_STYLES,
+                            value="Vypnutá",
+                            label="Logo a štýl potlače (zlúčené do hlavného výberu)",
                             filterable=False,
                             elem_classes=["strict-select"],
                             visible=False
@@ -1997,7 +2272,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         with gr.Row():
                             epsilon_slider = gr.Slider(minimum=1/255.0, maximum=32/255.0, value=8/255.0, step=1/255.0, label="Epsilon (sila šumu)", visible=False)
                             alpha_slider = gr.Slider(minimum=1/255.0, maximum=10/255.0, value=2/255.0, step=1/255.0, label="Alpha (krok)", visible=False)
-                            iter_slider = gr.Slider(minimum=10, maximum=250, value=65, step=5, label="Počet iterácií", visible=True)
+                            iter_slider = gr.Slider(minimum=10, maximum=250, value=85, step=5, label="Počet iterácií", visible=True)
 
                         with gr.Group(visible=True) as offsets_accordion:
                             gr.Markdown("##### Jemný posun prvkov (px)")
@@ -2046,7 +2321,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         elif selected_attack in ["Adversarial Patch (Leukoplast)", "Constellation Patch (Pimple Patches)", "Športová páska na nos (Breathe Right)"]:
                             default_iters = 80
                         elif is_hybrid:
-                            default_iters = 65
+                            default_iters = 85
 
                         show_leuko_size = is_leukoplast
                         show_dots_radius = is_const or is_hybrid
@@ -2057,17 +2332,9 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         if is_nasal or is_hybrid:
                             pos_update = gr.update(
                                 visible=True,
-                                choices=[
-                                    "1. Čierna športová páska (Athlete Black - Breathe Right)",
-                                    "2. Telová klasická (Tan Fabric - lekárenská)",
-                                    "3. Priesvitná silikónová (Clear Silicone)",
-                                    "4. Karbón s logom (Pro Carbon Logo)",
-                                    "5. Kinesio páska (3 športové farby)",
-                                    "6. Kozmetické hviezdičky (Starface Style)",
-                                    "7. Neobmedzený digitálny vzor (Plné RGB)",
-                                ],
-                                value="1. Čierna športová páska (Athlete Black - Breathe Right)",
-                                label="Vzhľad a materiál náplastí (Materiál & Dizajn)",
+                                choices=PROGRESSIVE_PATCH_STYLES,
+                                value=PROGRESSIVE_PATCH_STYLES[0],
+                                label="Vzhľad a štýl náplastí (postupnosť od najvyššej šance)",
                                 filterable=False,
                             )
                         elif is_leukoplast:
@@ -2124,7 +2391,7 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             gr.update(visible=show_dots_preset),
                             gr.update(visible=show_dots_radius),
                             gr.update(visible=show_strip_scale),
-                            gr.update(visible=False),
+                            gr.update(visible=False, value="Vypnutá"),
                             gr.update(visible=is_specpatch),
                             gr.update(visible=is_specpatch, value=info_text),
                             gr.update(visible=is_physical),
@@ -2511,16 +2778,18 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                             scale=2
                         )
                         tab2_flip_cam_btn = gr.Button("↔️ Otočiť kameru L/P", variant="secondary", size="sm", scale=1)
+                        tab2_light_btn = gr.Button("💡 Prisvietenie tváre", variant="secondary", size="sm", scale=1, elem_classes=["light-toggle-btn"])
                     
                     # Webkamera (streaming=False pre fotenie spúšťou, mirror=False bez zrkadlenia)
-                    collect_webcam = gr.Image(
-                        sources=["webcam"], 
-                        streaming=False, 
-                        type="pil",
-                        webcam_options=gr.WebcamOptions(mirror=False),
-                        label="Webkamera (odfoť sa a stlač Uložiť fotku)", 
-                        visible=True
-                    )
+                    with gr.Group(elem_id="collect_webcam_box"):
+                        collect_webcam = gr.Image(
+                            sources=["webcam"], 
+                            streaming=False, 
+                            type="pil",
+                            webcam_options=gr.WebcamOptions(mirror=False, constraints={"video": {"width": {"ideal": 1920}, "height": {"ideal": 1080}}}),
+                            label="Webkamera (odfoť sa a stlač Uložiť fotku)", 
+                            visible=True
+                        )
                     # Upload (schovaný defaultne)
                     collect_upload = gr.Image(
                         sources=["upload"], 
@@ -2601,7 +2870,12 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
             fn=on_tab1_webcam_snap,
             inputs=[tab1_webcam],
             outputs=[tab1_webcam, tab1_photo_preview, tab1_snap_msg, tab1_retake_btn, tab1_current_img],
-            show_progress="hidden"
+            show_progress="hidden",
+        ).then(
+            fn=None,
+            inputs=[],
+            outputs=[],
+            js="() => { const p = document.getElementById('tab1_photo_preview'); if (p && p.offsetParent !== null && window.__turnOffScreenSoftbox) window.__turnOffScreenSoftbox(); }",
         )
 
         # Nahratie fotky zo súboru: schová upload, na jeho mieste zobrazí vybratú fotku
@@ -2664,11 +2938,34 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
             outputs=[],
             js="() => { if (window.__toggleWebcamFlip) window.__toggleWebcamFlip(); }"
         )
+        tab1_light_btn.click(
+            fn=None,
+            inputs=[],
+            outputs=[],
+            js="() => { if (window.__toggleScreenSoftbox) window.__toggleScreenSoftbox(); }"
+        )
+        tab2_light_btn.click(
+            fn=None,
+            inputs=[],
+            outputs=[],
+            js="() => { if (window.__toggleScreenSoftbox) window.__toggleScreenSoftbox(); }"
+        )
+
+        def on_identify_click(curr_img, preview_img, web_img, up_img, model_nm, ens_mode):
+            img = None
+            for candidate in (curr_img, preview_img, web_img, up_img):
+                if candidate is not None:
+                    img = candidate
+                    break
+            print(f"[IDENTIFY] img_present={img is not None}, model={model_nm}, mode={ens_mode}")
+            o_face, a_img, n_img, o_id, a_id, st = run_identify(img, model_nm, ens_mode)
+            return o_face, a_img, n_img, o_id, a_id, st, (img if img is not None else curr_img)
 
         identify_btn.click(
-            fn=run_identify,
-            inputs=[tab1_current_img, model_dropdown, ensemble_mode_dropdown],
-            outputs=[orig_face_output, adv_image_output, noise_image_output, orig_identity_output, adv_identity_output, status_output]
+            fn=on_identify_click,
+            inputs=[tab1_current_img, tab1_photo_preview, tab1_webcam, tab1_upload, model_dropdown, ensemble_mode_dropdown],
+            outputs=[orig_face_output, adv_image_output, noise_image_output, orig_identity_output, adv_identity_output, status_output, tab1_current_img],
+            show_progress="full",
         )
 
         ar_webcam_stream.stream(
@@ -2814,6 +3111,8 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
 if __name__ == "__main__":
     # Vytvorenie zložky na dáta ak neexistuje
     os.makedirs(DATASET_DIR, exist_ok=True)
+    os.makedirs(EVAL_CAPTURES_DIR, exist_ok=True)
     
-    # Spustenie aplikácie na porte 7860 (default)
+    # Spustenie aplikácie s frontou pre stabilné spojenie bez timeoutov
+    app.queue(default_concurrency_limit=5)
     app.launch(server_name="0.0.0.0", server_port=7860, share=False, head=HEAD_SCRIPTS, css=custom_css)

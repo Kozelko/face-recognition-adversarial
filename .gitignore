@@ -43,3 +43,4 @@ todo.md
 run_*.py
 generate_master_testing_sheet.py
 evaluate_batched.py
+scratch/
