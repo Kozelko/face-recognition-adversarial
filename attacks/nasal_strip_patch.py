@@ -6,6 +6,10 @@ Maska vychádza z geometrie nosového mostíka s aplikáciou 3D zakrivenia a tie
 import math
 import ctypes
 try:
+    ctypes.CDLL('/home/kozel/miniconda/envs/cnn-benchmark/lib/libpng16.so.16', mode=ctypes.RTLD_GLOBAL)
+except Exception:
+    pass
+try:
     ctypes.CDLL('/home/kozel/miniconda/envs/cnn-benchmark/lib/python3.11/site-packages/opencv_contrib_python.libs/libpng16-ef62451c.so.16.44.0', mode=ctypes.RTLD_GLOBAL)
 except Exception:
     pass
@@ -16,6 +20,195 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from attacks.constellation_patch import extract_landmarks, get_surface_geometry_at_coords
+
+# Kanonických 58 3D trojuholníkov nosa z MediaPipe FaceMesh (FACEMESH_TESSELATION):
+# pokrývajú chrbát nosa (197->195->5->4), bočné steny a ryhu krídeliek (48 a 278).
+CANONICAL_NOSE_TRIANGLES = [
+    (3, 51, 195), (3, 51, 236), (3, 195, 197), (3, 196, 197), (3, 196, 236),
+    (4, 5, 51), (4, 5, 281), (4, 45, 51), (4, 275, 281), (5, 51, 195), (5, 195, 281),
+    (45, 51, 134), (45, 134, 220), (47, 114, 217), (47, 126, 217),
+    (48, 49, 64), (48, 49, 131), (48, 115, 131), (49, 64, 102), (49, 131, 209),
+    (51, 134, 236), (114, 174, 217), (115, 131, 220), (126, 209, 217),
+    (131, 134, 198), (131, 134, 220), (131, 198, 209), (134, 198, 236),
+    (174, 196, 236), (174, 217, 236), (195, 197, 248), (195, 248, 281),
+    (197, 248, 419), (198, 209, 217), (198, 217, 236), (248, 281, 456), (248, 419, 456),
+    (275, 281, 363), (275, 363, 440), (277, 343, 437), (277, 355, 437),
+    (278, 279, 294), (278, 279, 360), (278, 344, 360), (279, 294, 331), (279, 360, 429),
+    (281, 363, 456), (343, 399, 437), (344, 360, 440), (355, 429, 437),
+    (360, 363, 420), (360, 363, 440), (360, 420, 429), (363, 420, 456),
+    (399, 419, 456), (399, 437, 456), (420, 429, 437), (420, 437, 456),
+]
+
+
+def rasterize_barycentric_nasal_strip_mesh(
+    pts_3d: list | np.ndarray,
+    cx: float,
+    cy: float,
+    eff_w: float,
+    eff_hc: float,
+    eff_hw: float,
+    strip_angle: float,
+    arch_px: float,
+    box: tuple[int, int, int, int],
+    img_size: int = 112,
+    device: torch.device = torch.device("cpu"),
+    feather: float = 0.55,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    3D barycentrická UV rasterizácia Breathe Right pásky na kanonickú trianguláciu nosa MediaPipe:
+    - 58 3D trojuholníkov chrbta a bočných stien nosa (FACEMESH_TESSELATION)
+    - Skutočný Z-buffer a perspektívna projekcia
+    - Fyzikálne Lambertovo 3D tieňovanie podľa povrchových normál trojuholníkov
+    - Dvojité elastické vzpruhy a fotorealistický kontaktný tieň hrany papiera
+    Vráti: (full_mask, full_relief, full_shadow, full_sheen, uv_grid_2x)
+    """
+    y1, y2, x1, x2 = box
+    bh, bw = max(1, y2 - y1), max(1, x2 - x1)
+    sh2, sw2 = bh * 2, bw * 2
+
+    vert_indices = sorted(list({idx for t in CANONICAL_NOSE_TRIANGLES for idx in t}))
+    idx_to_pos = {idx: i for i, idx in enumerate(vert_indices)}
+
+    ca = math.cos(strip_angle)
+    sa = math.sin(strip_angle)
+    half_w = max(2.0, eff_w * 0.5)
+
+    def _vert_uv(pt):
+        px, py, _ = pt
+        dx = float(px) - cx
+        dy = float(py) - cy
+        xr = dx * ca + dy * sa
+        yr = -dx * sa + dy * ca
+        u = xr / half_w
+        u_c = max(-1.0, min(1.0, u))
+        u_abs = abs(u_c)
+        h_loc = eff_hc * 0.5 + (eff_hw * 0.5 - eff_hc * 0.5) * (u_abs ** 1.75)
+        arch_drop = arch_px * (u_abs ** 1.85)
+        v = (yr - arch_drop) / max(1.0, h_loc)
+        return u, v
+
+    pts_subset = [[float(pts_3d[idx][0]), float(pts_3d[idx][1]), float(pts_3d[idx][2])] for idx in vert_indices]
+    pts_t = torch.tensor(pts_subset, device=device, dtype=torch.float32)
+    uvs_t = torch.tensor([_vert_uv(pts_3d[idx]) for idx in vert_indices], device=device, dtype=torch.float32)
+    tri_indices = torch.tensor([[idx_to_pos[u], idx_to_pos[v], idx_to_pos[w]] for (u, v, w) in CANONICAL_NOSE_TRIANGLES],
+                               device=device, dtype=torch.long)
+
+    # 3D normály trojuholníkov
+    p0 = pts_t[tri_indices[:, 0]]
+    p1 = pts_t[tri_indices[:, 1]]
+    p2 = pts_t[tri_indices[:, 2]]
+    normals = torch.cross(p1 - p0, p2 - p0, dim=-1)
+    flip = torch.where(normals[:, 2:3] > 0, -1.0, 1.0)
+    normals = F.normalize(normals * flip, p=2, dim=-1)
+
+    # Supersampling 2x pixel mriežka výrezu
+    ys = torch.linspace(y1 + 0.25, y2 - 0.25, sh2, device=device)
+    xs = torch.linspace(x1 + 0.25, x2 - 0.25, sw2, device=device)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+    P = torch.stack([xx.flatten(), yy.flatten()], dim=-1)
+
+    v0_2d = p0[:, :2].unsqueeze(0)
+    v1_2d = p1[:, :2].unsqueeze(0)
+    v2_2d = p2[:, :2].unsqueeze(0)
+    P_ = P.unsqueeze(1)
+
+    v0v1 = v1_2d - v0_2d
+    v0v2 = v2_2d - v0_2d
+    v0p = P_ - v0_2d
+
+    d00 = (v0v1 * v0v1).sum(-1)
+    d01 = (v0v1 * v0v2).sum(-1)
+    d11 = (v0v2 * v0v2).sum(-1)
+    d20 = (v0p * v0v1).sum(-1)
+    d21 = (v0p * v0v2).sum(-1)
+
+    denom = d00 * d11 - d01 * d01
+    denom = torch.where(denom.abs() < 1e-6, torch.ones_like(denom), denom)
+
+    lam1 = (d11 * d20 - d01 * d21) / denom
+    lam2 = (d00 * d21 - d01 * d20) / denom
+    lam0 = 1.0 - lam1 - lam2
+
+    inside = (lam0 >= -0.015) & (lam1 >= -0.015) & (lam2 >= -0.015)
+
+    z0 = p0[:, 2].unsqueeze(0)
+    z1 = p1[:, 2].unsqueeze(0)
+    z2 = p2[:, 2].unsqueeze(0)
+    depth = lam0 * z0 + lam1 * z1 + lam2 * z2
+    depth_masked = torch.where(inside, depth, torch.full_like(depth, 999.0))
+    min_depth, win_tri = depth_masked.min(dim=1)
+    pixel_covered = (min_depth < 900.0)
+
+    uv0 = uvs_t[tri_indices[:, 0]]
+    uv1 = uvs_t[tri_indices[:, 1]]
+    uv2 = uvs_t[tri_indices[:, 2]]
+
+    m_idx = torch.arange(P.shape[0], device=device)
+    w_l0 = lam0[m_idx, win_tri].unsqueeze(-1)
+    w_l1 = lam1[m_idx, win_tri].unsqueeze(-1)
+    w_l2 = lam2[m_idx, win_tri].unsqueeze(-1)
+
+    pix_uv = w_l0 * uv0[win_tri] + w_l1 * uv1[win_tri] + w_l2 * uv2[win_tri]
+    win_norm = normals[win_tri]
+
+    # 3D Lambertovo osvetlenie s čelno-horným difúznym vektorom
+    light_dir = torch.tensor([0.15, -0.40, -0.90], device=device)
+    light_dir = F.normalize(light_dir, p=2, dim=-1)
+    cos_theta = -(win_norm * light_dir.unsqueeze(0)).sum(-1)
+    shading_3d = torch.clamp(0.48 + 0.62 * cos_theta, 0.45, 1.25)
+
+    u_grid = pix_uv[:, 0].reshape(sh2, sw2)
+    v_grid = pix_uv[:, 1].reshape(sh2, sw2)
+    shading_grid = shading_3d.reshape(sh2, sw2)
+    covered_grid = pixel_covered.reshape(sh2, sw2).float()
+
+    # Dvojité pružinové koľajničky v UV priestore
+    rail1 = torch.exp(-((v_grid - 0.44) ** 2) / 0.035)
+    rail2 = torch.exp(-((v_grid + 0.44) ** 2) / 0.035)
+    relief_2x = shading_grid + 0.035 * (rail1 + rail2)
+
+    # Breathe Right motýlia maska v UV priestore
+    r_cap = 0.18
+    x_dome = 1.0 - r_cap
+    u_abs = u_grid.abs()
+    dx_dome = torch.clamp(u_abs - x_dome, min=0.0)
+    dist_h = torch.where(u_abs <= x_dome, u_abs - 1.0, torch.sqrt((dx_dome / r_cap) ** 2 + v_grid ** 2) - 1.0)
+
+    waist_ratio = max(0.55, min(0.95, eff_hc / max(1.0, eff_hw)))
+    u_w = torch.clamp(u_abs / x_dome, 0.0, 1.0)
+    h_frac = waist_ratio + (1.0 - waist_ratio) * (u_w ** 1.75)
+    dist_v = v_grid.abs() - h_frac
+
+    dist_strip = torch.maximum(dist_h, dist_v)
+    mask_2x = torch.clamp(0.5 - dist_strip / max(0.06, feather * 0.22), 0.0, 1.0) * covered_grid
+
+    # Drop shadow pod spodnou hranou v UV priestore
+    dist_shadow = torch.maximum(dist_h, (v_grid - 0.22).abs() - h_frac)
+    shadow_raw = torch.clamp(0.5 - dist_shadow / 0.32, 0.0, 1.0) * covered_grid
+    drop_shadow_2x = torch.clamp(shadow_raw - mask_2x, 0.0, 1.0) * 0.18
+
+    # Jemný odlesk na hornom chrbte
+    spec_2x = (torch.clamp(1.0 - (v_grid + 0.40).abs() / 0.45, 0.0, 1.0) ** 2) * mask_2x * 0.05
+
+    # Downsampling na cieľový výrez
+    mask_box = F.avg_pool2d(mask_2x.unsqueeze(0).unsqueeze(0), kernel_size=2, stride=2).squeeze(0).squeeze(0)
+    relief_box = F.avg_pool2d((relief_2x * mask_2x + (1.0 - mask_2x)).unsqueeze(0).unsqueeze(0), kernel_size=2, stride=2).squeeze(0).squeeze(0)
+    drop_shadow_box = F.avg_pool2d(drop_shadow_2x.unsqueeze(0).unsqueeze(0), kernel_size=2, stride=2).squeeze(0).squeeze(0)
+    specular_box = F.avg_pool2d(spec_2x.unsqueeze(0).unsqueeze(0), kernel_size=2, stride=2).squeeze(0).squeeze(0)
+
+    # Vloženie do plátna celej fotky
+    full_mask = torch.zeros((1, 1, img_size, img_size), device=device, dtype=torch.float32)
+    full_relief = torch.ones((1, 1, img_size, img_size), device=device, dtype=torch.float32)
+    full_shadow = torch.zeros((1, 1, img_size, img_size), device=device, dtype=torch.float32)
+    full_sheen = torch.zeros((1, 1, img_size, img_size), device=device, dtype=torch.float32)
+
+    full_mask[:, :, y1:y2, x1:x2] = mask_box.unsqueeze(0).unsqueeze(0)
+    full_relief[:, :, y1:y2, x1:x2] = relief_box.unsqueeze(0).unsqueeze(0)
+    full_shadow[:, :, y1:y2, x1:x2] = drop_shadow_box.unsqueeze(0).unsqueeze(0)
+    full_sheen[:, :, y1:y2, x1:x2] = specular_box.unsqueeze(0).unsqueeze(0)
+
+    uv_grid_2x = torch.stack([u_grid, v_grid], dim=-1).unsqueeze(0)
+    return full_mask, full_relief, full_shadow, full_sheen, uv_grid_2x
 
 
 def create_nasal_strip_mask(
@@ -57,54 +250,58 @@ def create_nasal_strip_mask(
     else:
         half_w_local = torch.full_like(xr, half_w)
 
+    S = max(1.0, float(img_size) / 112.0)
     hc_half = max(1.5, 0.5 * height_center)
-    hw_half = max(2.2, 0.5 * height_wings)
+    hw_half = max(1.8, 0.5 * height_wings)
 
-    # 3D anatomické klenutie: páska je prehnutá cez chrbát nosa (∩) a jej konce
-    # klesajú po stenách nosa ku krídlom – presne ako reálna Breathe Right páska.
+    # 3D elastické klenutie tuhej pružinovej pásky Breathe Right (kalibrované sub-pixelovo
+    # podľa reálnej fotky osoby s Breathe Right páskou + webkamerových záberov):
+    # Ploché sedlo cez chrbát nosa -> plynulé ovinutie po 65° bočných stenách -> vyrovnanie v ryhe krídel.
     u_w = torch.clamp(torch.abs(xr) / half_w_local, 0.0, 1.0)
     arch_drop = max(0.0, float(arch_factor)) * max(0.0, float(arch_drop_px))
-    yr_arch = yr_raw - arch_drop * (u_w ** 1.8)
+    u_t = torch.clamp(u_w / 0.94, 0.0, 1.0)
+    arch_profile = torch.clamp(3.0 * (u_t ** 2) - 2.0 * (u_t ** 3), 0.0, 1.0) ** 1.85
+    yr_arch = yr_raw - arch_drop * arch_profile
 
-    # Plynulý atletický tvar Breathe Right:
-    # Jemný pás s hladkým rozšírením do kupolovitých zaoblených koncov
-    r_cap = half_w_local * 0.28
+    # Perspektívne skrátené tupo-zaoblené konce krídeliek (r_cap = 0.18 * half_w) + jemné rozšírenie na krídlach
+    r_cap = half_w_local * 0.18
     x_dome = torch.clamp(half_w_local - r_cap, min=1.0)
 
     u_waist = torch.clamp(torch.abs(xr) / x_dome, 0.0, 1.0)
-    s_waist = 0.5 * (1.0 - torch.cos(u_waist * math.pi))
+    s_waist = u_waist ** 1.75
     h_local = hc_half + (hw_half - hc_half) * s_waist
 
     dist_waist = torch.abs(yr_arch) - h_local
     dx = torch.clamp(torch.abs(xr) - x_dome, min=0.0)
-    dist_dome = torch.sqrt((dx * (hw_half / r_cap)) ** 2 + yr_arch ** 2) - hw_half
+    dist_dome = torch.sqrt((dx * (h_local / torch.clamp(r_cap, min=0.8))) ** 2 + yr_arch ** 2) - h_local
 
     in_strip_dist = torch.where(torch.abs(xr) <= x_dome, dist_waist, dist_dome)
-    mask = torch.clamp(0.5 - in_strip_dist / max(0.35, feather), 0.0, 1.0).view(1, 1, img_size, img_size)
+    eff_feather = max(0.48, float(feather))
+    mask = torch.clamp(0.5 - in_strip_dist / eff_feather, 0.0, 1.0).view(1, 1, img_size, img_size)
 
-    # Výraznejšie valcové stmavenie na bočných stenách nosa
-    shading_lateral = torch.clamp(1.02 - 0.20 * (u_w ** 2), 0.80, 1.04)
+    # Jemný okrajový útlm matného materiálu voči podpovrchovému rozptylu kože (smerový tieň nosa sa berie priamo z fotky!)
+    shading_lateral = torch.clamp(1.0 - 0.16 * (u_w ** 2), 0.80, 1.02)
     if yaw != 0.0:
-        shading_lateral = shading_lateral * (1.0 + 0.12 * math.sin(yaw) * torch.clamp(xr / half_w_local, -1.0, 1.0))
+        shading_lateral = shading_lateral * (1.0 + 0.10 * math.sin(yaw) * torch.clamp(xr / half_w_local, -1.0, 1.0))
     shading = shading_lateral.view(1, 1, img_size, img_size)
 
-    rail_offset = max(1.0, hc_half * 0.50)
-    rail1 = torch.exp(-((yr_arch - rail_offset) ** 2) / 0.85)
-    rail2 = torch.exp(-((yr_arch + rail_offset) ** 2) / 0.85)
-    rails = ((rail1 + rail2) * 0.08).view(1, 1, img_size, img_size)
+    rail_offset = max(0.9 * S, hc_half * 0.44)
+    rail1 = torch.exp(-((yr_arch - rail_offset) ** 2) / (1.1 * S * S))
+    rail2 = torch.exp(-((yr_arch + rail_offset) ** 2) / (1.1 * S * S))
+    rails = ((rail1 + rail2) * 0.018).view(1, 1, img_size, img_size)
 
     surface_relief = shading + rails
 
-    # Kontaktný tieň a odlesk kopírujúci tvar nosa
-    shadow_yr = yr_arch - 0.70
+    # Jemný 0.45 px kontaktný mikro-tieň hrany pásky/papiera na pokožke pod spodným oblúkom
+    shadow_yr = yr_arch - 0.45 * S
     dist_w_s = torch.abs(shadow_yr) - h_local
-    dist_d_s = torch.sqrt((dx * (hw_half / r_cap)) ** 2 + shadow_yr ** 2) - hw_half
+    dist_d_s = torch.sqrt((dx * (h_local / torch.clamp(r_cap, min=0.8))) ** 2 + shadow_yr ** 2) - h_local
     shadow_dist = torch.where(torch.abs(xr) <= x_dome, dist_w_s, dist_d_s)
-    shadow_raw = torch.clamp(0.5 - shadow_dist / 0.85, 0.0, 1.0).view(1, 1, img_size, img_size)
-    drop_shadow = (torch.clamp(shadow_raw - mask, 0.0, 1.0) * 0.28).view(1, 1, img_size, img_size)
+    shadow_raw = torch.clamp(0.5 - shadow_dist / (0.68 * S), 0.0, 1.0).view(1, 1, img_size, img_size)
+    drop_shadow = (torch.clamp(shadow_raw - mask, 0.0, 1.0) * 0.18).view(1, 1, img_size, img_size)
 
     spec_yr = yr_arch + h_local * 0.50
-    specular_sheen = (torch.clamp(1.0 - torch.abs(spec_yr) / 0.85, 0.0, 1.0) ** 2 * mask * 0.10).view(1, 1, img_size, img_size)
+    specular_sheen = (torch.clamp(1.0 - torch.abs(spec_yr) / (0.85 * S), 0.0, 1.0) ** 2 * mask * 0.06).view(1, 1, img_size, img_size)
 
     return mask, surface_relief, drop_shadow, specular_sheen
 
@@ -336,6 +533,10 @@ def compute_nasal_strip_placement(
     has_alar = pts is not None and len(pts) > 278
     has_bridge = pts is not None and len(pts) > 197
 
+    ipd_scale = max(0.35, float(eye_dist) / 43.2)
+    min_w = 22.0 * ipd_scale
+    max_w = 27.6 * ipd_scale
+
     alar_mid_x = alar_mid_y = None
     if has_alar:
         # Spojnica nosových krídel = skutočná priečna os nosa (vpravo od ľavého krídla)
@@ -349,37 +550,35 @@ def compute_nasal_strip_placement(
         nose_angle = math.atan2(ay, ax)
         alar_mid_x = float(alar_l[0] + alar_r[0]) * 0.5
         alar_mid_y = float(alar_l[1] + alar_r[1]) * 0.5
-        alar_w = max(nose_w * 1.24, eye_dist * 0.58)
-        base_w = max(23.5, min(29.0, alar_w)) * float(width_scale)
+        # Sub-pixelová kalibrácia podľa oficiálnej referenčnej fotky Breathe Right,
+        # plne proporcionálna k rozostupu očí (ipd_scale) a šírke nosa ľubovoľnej osoby:
+        alar_w = max(nose_w * 1.04, eye_dist * 0.56)
+        base_w = max(min_w, min(max_w, alar_w)) * float(width_scale)
     else:
         nose_angle = None
-        base_w = max(23.5, min(29.0, eye_dist * 0.58)) * float(width_scale)
+        base_w = max(min_w, min(max_w, eye_dist * 0.56)) * float(width_scale)
 
-    base_hc = base_w * (16.0 / 58.0)  # stred chrbta nosa (reálna 2D projekcia 58×20 mm pásky)
-    base_hw = base_w * (23.0 / 58.0)  # bočné krídla klesajúce po stenách nosa
+    # Štíhly pružinový pás v strede chrbta nosa (~5.10 px) s jemne rozšírenými oblými krídelkami (~6.20 px)
+    base_hc = base_w * (5.10 / 25.48)
+    base_hw = base_w * (6.20 / 25.48)
 
-    # Stred pásky = nosový mostík medzi landmarkami 195 a 5 (presne ako na oficiálnej
-    # fotke Breathe Right). Nesedí na špičke nosa ani na jeho koreni.
+    # Anatomické sedlo pásky tesne nad rozšírením nosových dierok (0.35 * pts[195] + 0.65 * pts[5])
     if has_bridge:
-        cx = float(pts[195][0] + pts[5][0]) * 0.5
-        cy = float(pts[195][1] + pts[5][1]) * 0.5
+        cx = float(0.35 * pts[195][0] + 0.65 * pts[5][0])
+        cy = float(0.35 * pts[195][1] + 0.65 * pts[5][1])
     else:
-        # Bez 3D siete: stred medzi očnou líniou a špičkou nosa (cca 62 %)
         cx = (lx + rx) * 0.5
-        cy = (ly + ry) * 0.5 + (ny - (ly + ry) * 0.5) * 0.62
+        cy = (ly + ry) * 0.5 + (ny - (ly + ry) * 0.5) * 0.64
 
-    cx = float(np.clip(cx + float(offset_x), 10.0, 102.0))
-    cy = float(np.clip(cy + float(offset_y), 10.0, 102.0))
+    cx = float(np.clip(cx + float(offset_x), 4.0 * ipd_scale, 112.0 * ipd_scale - 4.0 * ipd_scale)) if ipd_scale > 1.25 else float(np.clip(cx + float(offset_x), 10.0, 102.0))
+    cy = float(np.clip(cy + float(offset_y), 4.0 * ipd_scale, 112.0 * ipd_scale - 4.0 * ipd_scale)) if ipd_scale > 1.25 else float(np.clip(cy + float(offset_y), 10.0, 102.0))
 
-    # Klenutie: konce pásky klesajú ku spojnici krídel, teda sa páska ohne cez nos.
-    # Zmerané na oficiálnej fotke: koniec pásky klesne o cca 1/4 až 1/3 vzdialenosti
-    # stred -> krídla (na 112 px frame to vychádza ~3 px).
-    half_w = base_w * 0.5
+    # Fyzikálny pokles pružinového pásu cez sedlo nosa ku ryhe krídel (proporcionálne pre akýkoľvek nos a zoom)
     if has_alar:
         drop = -(alar_mid_x - cx) * math.sin(nose_angle) + (alar_mid_y - cy) * math.cos(nose_angle)
     else:
-        drop = 0.30 * (ny - (ly + ry) * 0.5)
-    arch_px = float(np.clip(0.35 * drop, 0.0, 0.50 * half_w))
+        drop = 0.42 * (ny - (ly + ry) * 0.5)
+    arch_px = float(np.clip(drop - 0.85 * ipd_scale - 0.5 * base_hw, 3.20 * ipd_scale, 4.15 * ipd_scale))
 
     eff_w, eff_hc, eff_hw, strip_angle, eff_yaw, arch_f = compute_strip_3d_adaptation(
         pts, cx, cy, base_w, base_hc, base_hw, roll, yaw, nose_angle=nose_angle

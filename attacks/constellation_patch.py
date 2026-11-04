@@ -35,6 +35,17 @@ def get_mediapipe_landmarker():
     return _mp_landmarker
 
 
+def close_mediapipe_landmarker():
+    """Uvoľní C++ XNNPACK threadpool MediaPipe pred GPU optimalizáciou (zabraňuje kolízii vlákien vo WSL2)."""
+    global _mp_landmarker
+    if _mp_landmarker is not None:
+        try:
+            _mp_landmarker.close()
+        except Exception:
+            pass
+        _mp_landmarker = None
+
+
 def extract_landmarks(image_tensor: torch.Tensor, mtcnn=None, return_mesh: bool = False):
     """
     Extrahuje landmarky z tváre (112x112).
