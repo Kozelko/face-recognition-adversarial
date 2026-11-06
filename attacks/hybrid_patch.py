@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from attacks.constellation_patch import extract_landmarks, create_elliptical_patch_mask, get_mesh_point_geometry, get_surface_geometry_at_coords
-from attacks.nasal_strip_patch import create_nasal_strip_mask, compute_nasal_strip_placement
+from attacks.nasal_strip_patch import create_nasal_strip_mask, compute_nasal_strip_placement, rasterize_barycentric_nasal_strip_mesh
 
 
 # --- Reálne rozmery Breathe Right pásky (mm) ---
@@ -26,8 +26,8 @@ from attacks.nasal_strip_patch import create_nasal_strip_mask, compute_nasal_str
 # (base_hc = 13/58, base_hw = 20/58 šírky). Tlačový hárok kreslí pásku 1:1 v týchto
 # reálnych rozmeroch, takže vytlačený papierik sedí na reálnu Breathe Right.
 STRIP_LEN_MM = 58.0      # celková dĺžka pásky
-STRIP_WAIST_MM = 13.0    # výška v strede (zúžený pás)
-STRIP_WINGS_MM = 20.0    # výška na koncoch (krídelká / max)
+STRIP_WAIST_MM = 14.0    # výška v strede (štíhly pružinový pás)
+STRIP_WINGS_MM = 20.0    # výška na koncoch (oblé krídelká)
 DOT_DIAM_MM = 15.0       # priemer okrúhlych nálepiek
 
 # --- Vysoko rozlíšené textúrové buffery (aby 300 DPI vzor nebol "kockatý") ---
@@ -56,29 +56,88 @@ _JPEG_LUMA_Q = torch.tensor([
 ], dtype=torch.float32)
 
 
-def _illumination_gain(image: torch.Tensor) -> torch.Tensor:
-    """
-    Fotometricky adaptívne osvetlenie pokožky:
-    Nálepka neodráža viac svetla, než do miestnosti reálne dopadá.
-    1. Lokálny tieň/svetlo tváre (3D gradient nosa/líc).
-    2. Adaptácia na celkový jas tváre (ak je webkamera tmavá / v tieni,
-       nálepka automaticky stmavne a nesvieti ako umelý cut-and-paste objekt).
-    """
-    skin_lum = 0.299 * image[:, 0:1] + 0.587 * image[:, 1:2] + 0.114 * image[:, 2:3]
-    lum01 = torch.clamp(skin_lum * 0.5 + 0.5, 0.0, 1.0)
-    k = 5
-    t = torch.arange(k, dtype=torch.float32, device=image.device) - (k - 1) * 0.5
-    wts = torch.exp(-(t ** 2) / (2.0 * 1.2 ** 2))
+def _gblur_fixed(x: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Rýchle diferencovateľné separabilné Gaussovo rozmazanie s pevnou sigmou."""
+    if sigma <= 0.05:
+        return x
+    c = x.shape[1]
+    r = max(1, int(math.ceil(sigma * 2.8)))
+    t = torch.arange(-r, r + 1, dtype=torch.float32, device=x.device)
+    wts = torch.exp(-(t ** 2) / (2.0 * sigma * sigma))
     wts = wts / wts.sum()
-    blurred = F.conv2d(F.pad(lum01, (k // 2, k // 2, 0, 0), mode="replicate"), wts.view(1, 1, 1, k))
-    blurred = F.conv2d(F.pad(blurred, (0, 0, k // 2, k // 2), mode="replicate"), wts.view(1, 1, k, 1))
-    h, w = blurred.shape[-2], blurred.shape[-1]
-    y0, y1 = int(h * 0.22), int(h * 0.68)
-    x0, x1 = int(w * 0.22), int(w * 0.78)
-    mean_lum = blurred[:, :, y0:y1, x0:x1].mean(dim=(-2, -1), keepdim=True).clamp_min(0.10)
-    rel_illum = blurred / mean_lum
-    ambient_factor = torch.clamp(mean_lum / 0.48, 0.45, 1.15)
-    return torch.clamp(rel_illum * ambient_factor * 0.95, 0.35, 1.25)
+    kx = wts.view(1, 1, 1, -1).expand(c, 1, 1, -1)
+    ky = wts.view(1, 1, -1, 1).expand(c, 1, -1, 1)
+    out = F.conv2d(F.pad(x, (r, r, 0, 0), mode="replicate"), kx, groups=c)
+    out = F.conv2d(F.pad(out, (0, 0, r, r), mode="replicate"), ky, groups=c)
+    return out
+
+
+def _illumination_gain(image: torch.Tensor, boxes: dict | None = None) -> torch.Tensor:
+    """
+    Fotometricky kalibrované 3-kanálové (RGB) osvetlenie scény:
+    1. Na nose (sigma ~1.25 px) prenáša presný lokálny smerový tieň stien nosa z fotky 1:1.
+    2. Na lícach/brade (sigma ~2.80 px) meria makro-osvetlenie miestnosti s rozptýleným izbovým
+       svetlom, aby chĺpky/póry pod papierovou nálepkou nespôsobili neprirodzené stmavnutie.
+    3. Prenáša reálnu expozíciu a farebnú teplotu svetla v miestnosti (WB).
+    Vracia tenzor (B, 3, H, W).
+    """
+    img01 = torch.clamp(image * 0.5 + 0.5, 0.0, 1.0)
+    b, c, h, w = img01.shape
+    s = max(1.0, float(h) / 112.0)
+
+    skin_nose = _gblur_fixed(img01, sigma=1.25 * s)
+    skin_cheek = _gblur_fixed(img01, sigma=2.80 * s)
+
+    lum_nose = 0.299 * skin_nose[:, 0:1] + 0.587 * skin_nose[:, 1:2] + 0.114 * skin_nose[:, 2:3]
+    lum_cheek = 0.299 * skin_cheek[:, 0:1] + 0.587 * skin_cheek[:, 1:2] + 0.114 * skin_cheek[:, 2:3]
+
+    y0, y1 = int(h * 0.25), int(h * 0.68)
+    x0, x1 = int(w * 0.24), int(w * 0.76)
+    roi_lum = lum_nose[:, :, y0:y1, x0:x1]
+    roi_rgb = skin_nose[:, :, y0:y1, x0:x1]
+
+    ref_lum = (
+        roi_lum.mean(dim=(-2, -1), keepdim=True)
+        + 0.75 * roi_lum.std(dim=(-2, -1), keepdim=True)
+    ).clamp_min(0.14)
+
+    # Odhad intenzity a farby zdroja svetla nezávislý od odtieňa pleti (cez top 5 % odleskov T-zóny a očných bielok)
+    flat_lum = roi_lum.flatten(start_dim=-2)
+    k_top = max(4, int(flat_lum.shape[-1] * 0.05))
+    top_vals, top_idx = torch.topk(flat_lum, k=k_top, dim=-1)
+    spec_lum = top_vals.mean(dim=-1, keepdim=True).unsqueeze(-1).clamp_min(0.16)
+    exposure = torch.clamp(torch.maximum(ref_lum / 0.58, spec_lum / 0.76), 0.52, 1.08)
+
+    # V pomere lum_nose / ref_lum sa albedo (melanín) pokožky vykráti -> ostane čistý 3D smerový tieň scény!
+    shade_nose = torch.clamp(lum_nose / ref_lum, 0.36, 1.06)
+    shade_cheek = torch.clamp(0.34 + 0.66 * (lum_cheek / ref_lum), 0.54, 1.06)
+
+    if boxes is not None and "strip_mask" in boxes:
+        sm = boxes["strip_mask"].to(image.device)
+        if sm.shape[-2:] != (h, w):
+            sm = F.interpolate(sm, size=(h, w), mode="bilinear", align_corners=False)
+        spatial_lum = torch.where(sm > 0.02, shade_nose, shade_cheek)
+    else:
+        # Spodná časť tváre (líca/brada mimo nosového pruhu x=0.36..0.64) používa makro-osvetlenie
+        xs = torch.linspace(0.0, 1.0, w, device=image.device).view(1, 1, 1, w)
+        in_nose_col = ((xs >= 0.36) & (xs <= 0.64)).float()
+        spatial_lum = in_nose_col * shade_nose + (1.0 - in_nose_col) * shade_cheek
+
+    skin_neutral = torch.tensor([1.10, 0.96, 0.94], dtype=torch.float32, device=image.device).view(1, 3, 1, 1)
+    mean_rgb = roi_rgb.mean(dim=(-2, -1), keepdim=True)
+    mean_l = roi_lum.mean(dim=(-2, -1), keepdim=True).clamp_min(0.10)
+    wb_skin = (mean_rgb / mean_l) / skin_neutral
+
+    flat_rgb = roi_rgb.flatten(start_dim=-2)
+    spec_rgb = torch.gather(flat_rgb, -1, top_idx.expand(-1, 3, -1)).mean(dim=-1, keepdim=True).unsqueeze(-1)
+    wb_spec = spec_rgb / spec_lum
+
+    raw_wb = 0.55 * wb_spec + 0.45 * wb_skin
+    wb_luma = (0.299 * raw_wb[:, 0:1] + 0.587 * raw_wb[:, 1:2] + 0.114 * raw_wb[:, 2:3]).clamp_min(0.10)
+    raw_wb = raw_wb / wb_luma
+    wb_rgb = torch.clamp(1.0 + 0.72 * (raw_wb - 1.0), 0.76, 1.24)
+
+    return torch.clamp(spatial_lum * exposure * wb_rgb, 0.28, 1.20)
 
 
 def _region_field(field: torch.Tensor, box: tuple[int, int, int, int], tex_h: int, tex_w: int, pad: int = 2) -> torch.Tensor:
@@ -92,6 +151,147 @@ def _region_field(field: torch.Tensor, box: tuple[int, int, int, int], tex_h: in
     return F.interpolate(crop, size=(tex_h, tex_w), mode="bilinear", align_corners=False)
 
 
+def _paper_albedo(texture: torch.Tensor) -> torch.Tensor:
+    """
+    Fyzikálna odrazivosť (albedo v [0, 1]) matného 80g kancelárskeho papiera vytlačeného
+    na Canon PIXMA TS3450 (PG-545 pigment black + CL-546 dye color):
+      - Stage 1 rozpíjanie kvapiek atramentu do vlákien papiera (dot gain blur),
+      - farebná sýtosť CMY atramentu na matnom papieri (~0.72),
+      - najtmavšia matná čierna odráža rozptýlené izbové svetlo (~0.17),
+      - nepotlačený biely papier má difúznu odrazivosť ~0.94.
+    """
+    tex01 = torch.clamp(texture * 0.5 + 0.5, 0.0, 1.0)
+    sig_ink = 1.10 if tex01.shape[-1] >= 128 else 0.65
+    tex_ink = _gblur_fixed(tex01, sigma=sig_ink)
+    luma = 0.299 * tex_ink[:, 0:1] + 0.587 * tex_ink[:, 1:2] + 0.114 * tex_ink[:, 2:3]
+    tex_matte = torch.clamp(luma + (tex_ink - luma) * 0.72, 0.0, 1.0)
+    return 0.17 + tex_matte * (0.94 - 0.17)
+
+
+def _warp_flat_strip_to_box(
+    albedo_hr: torch.Tensor,
+    box: tuple[int, int, int, int],
+    strip_geom: dict,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    3D valcové + elastické sedlové ovinutie plochej Breathe Right pásky (96x256) na chrbát
+    a šikmé bočné steny nosa v 2x supersamplingu (100 % zhodné s create_nasal_strip_mask).
+    Ak je k dispozícii predpočítaná barycentrická 3D UV mriežka (mesh_uv_grid), použije
+    priamo reálnu 3D trianguláciu nosa (MediaPipe).
+    """
+    mesh_uv = strip_geom.get("mesh_uv_grid")
+    if mesh_uv is not None:
+        grid = mesh_uv.to(device)
+        if albedo_hr.shape[0] > 1 and grid.shape[0] == 1:
+            grid = grid.expand(albedo_hr.shape[0], -1, -1, -1)
+        warped_2x = F.grid_sample(albedo_hr, grid, mode="bilinear", padding_mode="border", align_corners=False)
+        return F.avg_pool2d(warped_2x, kernel_size=2, stride=2)
+
+    y1, y2, x1, x2 = box
+    bh, bw = max(1, y2 - y1), max(1, x2 - x1)
+    sh2, sw2 = bh * 2, bw * 2
+    ys = torch.linspace(y1 + 0.25, y2 - 0.25, sh2, device=device)
+    xs = torch.linspace(x1 + 0.25, x2 - 0.25, sw2, device=device)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+
+    cx = float(strip_geom["cx"])
+    cy = float(strip_geom["cy"])
+    half_w = max(4.0, float(strip_geom["eff_w"]) * 0.5)
+    hc_half = max(1.5, float(strip_geom["eff_hc"]) * 0.5)
+    hw_half = max(1.8, float(strip_geom["eff_hw"]) * 0.5)
+    ang = float(strip_geom.get("angle", 0.0))
+    arch_drop = max(0.0, float(strip_geom.get("arch_drop", 0.0)))
+    yaw = float(strip_geom.get("yaw", 0.0))
+
+    dx = xx - cx
+    dy = yy - cy
+    ca, sa = math.cos(ang), math.sin(ang)
+    xr = dx * ca + dy * sa
+    yr_raw = -dx * sa + dy * ca
+
+    if abs(yaw) > 0.04:
+        scale_diff = float(np.clip(0.18 * math.sin(yaw), -0.22, 0.22))
+        half_w_local = torch.where(
+            xr >= 0.0,
+            torch.full_like(xr, half_w * (1.0 + scale_diff)),
+            torch.full_like(xr, half_w * (1.0 - scale_diff)),
+        )
+    else:
+        half_w_local = torch.full_like(xr, half_w)
+
+    u_proj = torch.clamp(xr / torch.clamp(half_w_local, min=2.0), -1.0, 1.0)
+    u_abs = torch.abs(u_proj)
+
+    # Valcové rozvinutie pozdĺž stien nosa (stred čelne ku kamere, bočné krídla sklonené ~64°)
+    theta_max = 1.12
+    sin_tmax = math.sin(theta_max)
+    u_flat = torch.asin(torch.clamp(u_proj * sin_tmax, -0.999, 0.999)) / theta_max
+
+    # Elastický profil pružinového pásu zhodný s create_nasal_strip_mask
+    u_t = torch.clamp(u_abs / 0.94, 0.0, 1.0)
+    arch_profile = torch.clamp(3.0 * (u_t ** 2) - 2.0 * (u_t ** 3), 0.0, 1.0) ** 1.85
+    yr_arch = yr_raw - arch_drop * arch_profile
+
+    r_cap = half_w_local * 0.18
+    x_dome = torch.clamp(half_w_local - r_cap, min=1.0)
+    u_waist = torch.clamp(torch.abs(xr) / x_dome, 0.0, 1.0)
+    s_waist = u_waist ** 1.75
+    h_local = hc_half + (hw_half - hc_half) * s_waist
+
+    waist_ratio_paper = STRIP_WAIST_MM / STRIP_WINGS_MM
+    u_paper_w = torch.clamp(torch.abs(u_flat) / 0.78, 0.0, 1.0)
+    paper_h_frac = waist_ratio_paper + (1.0 - waist_ratio_paper) * (u_paper_w ** 1.75)
+    v_flat = (yr_arch / torch.clamp(h_local, min=1.0)) * paper_h_frac
+
+    grid = torch.stack([u_flat, v_flat], dim=-1).unsqueeze(0)
+    if albedo_hr.shape[0] > 1:
+        grid = grid.expand(albedo_hr.shape[0], -1, -1, -1)
+    warped_2x = F.grid_sample(albedo_hr, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    return F.avg_pool2d(warped_2x, kernel_size=2, stride=2)
+
+
+def _warp_flat_dot_to_box(
+    albedo_hr: torch.Tensor,
+    box: tuple[int, int, int, int],
+    dot_geom_tuple: tuple,
+    r_dot: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    3D perspektívne skrátenie (foreshortening) plochej kruhovej nálepky (96x96) na naklonené
+    líce/bradu pomocou symetrického tenzora M^{-1} (orientácia „HORE“ ostáva nahor k očiam).
+    """
+    y1, y2, x1, x2 = box
+    bh, bw = max(1, y2 - y1), max(1, x2 - x1)
+    sh2, sw2 = bh * 2, bw * 2
+    ys = torch.linspace(y1 + 0.25, y2 - 0.25, sh2, device=device)
+    xs = torch.linspace(x1 + 0.25, x2 - 0.25, sw2, device=device)
+    yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+
+    cx_d, cy_d, cos_d, tilt_d = (
+        float(dot_geom_tuple[0]),
+        float(dot_geom_tuple[1]),
+        max(0.38, float(dot_geom_tuple[2])),
+        float(dot_geom_tuple[3]),
+    )
+    dx = xx - cx_d
+    dy = yy - cy_d
+    ux, uy = math.cos(tilt_d), math.sin(tilt_d)
+    vx, vy = -math.sin(tilt_d), math.cos(tilt_d)
+    du = (dx * ux + dy * uy) / cos_d
+    dv = dx * vx + dy * vy
+    r_eff = max(1.0, float(r_dot))
+    u_dot = (du * ux + dv * vx) / r_eff
+    v_dot = (du * uy + dv * vy) / r_eff
+
+    grid = torch.stack([u_dot, v_dot], dim=-1).unsqueeze(0)
+    if albedo_hr.shape[0] > 1:
+        grid = grid.expand(albedo_hr.shape[0], -1, -1, -1)
+    warped_2x = F.grid_sample(albedo_hr, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    return F.avg_pool2d(warped_2x, kernel_size=2, stride=2)
+
+
 def _compose_region(
     texture: torch.Tensor,
     box: tuple[int, int, int, int],
@@ -102,37 +302,173 @@ def _compose_region(
     blend: float,
 ) -> torch.Tensor:
     """
-    Zloží jednu vysokorozlíšenú textúru na finálnu "fyzickú" podobu patche:
-    (textúra -> [0,1]) * osvetlenie * reliéf  ->  späť do [-1,1]  ->  priehľadnosť.
-    Presne táto zložená podoba sa neskôr downsample-uje do scény pre model
-    a zároveň sa tlačí (konzistencia trénovania a tlače).
+    Spätná kompatibilita pre ploché regióny bez 3D geometrie.
     """
     tex_h, tex_w = tex_size
     gain_hr = _region_field(gain_full, box, tex_h, tex_w)
     relief_hr = _region_field(relief_full, box, tex_h, tex_w)
     img_hr = _region_field(image, box, tex_h, tex_w)
-    tex01 = torch.clamp(texture * 0.5 + 0.5, 0.0, 1.0)
-    lit01 = torch.clamp(tex01 * gain_hr * relief_hr, 0.0, 1.0)
+    albedo_hr = _paper_albedo(texture)
+    lit01 = torch.clamp(albedo_hr * gain_hr * (0.10 + 0.90 * relief_hr) + 0.03 * gain_hr, 0.0, 1.0)
     lit = lit01 * 2.0 - 1.0
     comp = blend * lit + (1.0 - blend) * img_hr
     return comp.clamp(-1.0, 1.0)
 
 
-def _build_canvas(image, region_specs, gain_full, relief_full, blend):
+def _build_canvas(image, region_specs, gain_full, relief_full, blend, boxes: dict | None = None):
     """
-    Vloží všetky textúry do scény 112x112: vysokorozlíšená textúra sa zloží,
-    diferencovateľne downsample-uje do cieľového boxu a tam sa zamaskuje.
-    Vracia (canvas, comps) - comps sú vysokorozlíšené zložené patche.
+    Vloží všetky textúry do scény 112x112 s plným 3D ovinutím na nos a líca,
+    aplikáciou lokálneho 3-kanálového osvetlenia miestnosti a Lambertovho 3D tieňovania.
     """
     canvas = image.clone()
     comps = {}
+    device = image.device
+    strip_geom = (boxes or {}).get("strip_geom")
+    dot_geom_map = (boxes or {}).get("dot_geom") or {}
+    r_dot_eff = float((boxes or {}).get("dot_radius_eff", 4.6))
+
     for key, (texture, box, tex_size) in region_specs.items():
-        comp_hr = _compose_region(texture, box, tex_size, image, gain_full, relief_full, blend)
         y1, y2, x1, x2 = box
-        box_patch = F.interpolate(comp_hr, size=(y2 - y1, x2 - x1), mode="bilinear", align_corners=False, antialias=True)
+        albedo_hr = _paper_albedo(texture)
+
+        if key == "strip" and strip_geom is not None:
+            albedo_box = _warp_flat_strip_to_box(albedo_hr, box, strip_geom, device)
+        elif key in dot_geom_map:
+            albedo_box = _warp_flat_dot_to_box(albedo_hr, box, dot_geom_map[key], r_dot_eff, device)
+        else:
+            albedo_box = F.interpolate(albedo_hr, size=(y2 - y1, x2 - x1), mode="bilinear", align_corners=False, antialias=True)
+
+        gain_box = gain_full[:, :, y1:y2, x1:x2]
+        relief_box = relief_full[:, :, y1:y2, x1:x2]
+        img_box = image[:, :, y1:y2, x1:x2]
+
+        # Multiplikatívna fotometria matného papiera bez dvojitého stmavovania + jemný odlesk rezanej hrany
+        lit_box01 = torch.clamp(albedo_box * gain_box * relief_box, 0.0, 1.0)
+        lit_box = lit_box01 * 2.0 - 1.0
+        box_patch = (blend * lit_box + (1.0 - blend) * img_box).clamp(-1.0, 1.0)
         canvas[:, :, y1:y2, x1:x2] = box_patch
-        comps[key] = comp_hr
+        comps[key] = (albedo_hr * 2.0 - 1.0).clamp(-1.0, 1.0)
     return canvas, comps
+
+
+def _laplacian_pyramid_blend(
+    bg: torch.Tensor,
+    fg: torch.Tensor,
+    mask: torch.Tensor,
+    sigmas: tuple[float, float] = (1.4, 3.8),
+    mask_sigmas: tuple[float, float, float] = (0.4, 1.3, 3.0),
+) -> torch.Tensor:
+    """
+    Viacpásmové frekvenčné spájanie okrajov nálepky s pokožkou (Laplacian Pyramid Blending):
+      - L0 (vysoké frekvencie: zrno, mikroskopické detaily tlače, ostrý rez papiera) -> maska M0 (úzky prechod).
+      - L1 (stredné frekvencie: tiene hrán a gradienty) -> maska M1 (stredný prechod).
+      - G2 (nízke frekvencie: difúzne okolité osvetlenie a odrazivosť) -> maska M2 (široký prechod).
+    Zabezpečuje matematicky identickú rekonštrukciu pokožky mimo nálepky a prirodzený prechod bez viditeľného švu.
+    """
+    if bg.dim() == 3:
+        bg = bg.unsqueeze(0)
+    if fg.dim() == 3:
+        fg = fg.unsqueeze(0)
+    if mask.dim() == 3:
+        mask = mask.unsqueeze(1)
+    elif mask.dim() == 2:
+        mask = mask.view(1, 1, mask.shape[0], mask.shape[1])
+
+    s1, s2 = sigmas
+    ms0, ms1, ms2 = mask_sigmas
+
+    bg_g1 = _gblur_fixed(bg, s1)
+    bg_g2 = _gblur_fixed(bg_g1, s2)
+    bg_l0 = bg - bg_g1
+    bg_l1 = bg_g1 - bg_g2
+    bg_res = bg_g2
+
+    fg_g1 = _gblur_fixed(fg, s1)
+    fg_g2 = _gblur_fixed(fg_g1, s2)
+    fg_l0 = fg - fg_g1
+    fg_l1 = fg_g1 - fg_g2
+    fg_res = fg_g2
+
+    m0 = _gblur_fixed(mask, ms0) if ms0 > 0.08 else mask
+    m1 = _gblur_fixed(mask, ms1)
+    m2 = _gblur_fixed(mask, ms2)
+
+    b0 = m0 * fg_l0 + (1.0 - m0) * bg_l0
+    b1 = m1 * fg_l1 + (1.0 - m1) * bg_l1
+    b_res = m2 * fg_res + (1.0 - m2) * bg_res
+
+    return b0 + b1 + b_res
+
+
+def composite_realistic_stickers(
+    image: torch.Tensor,
+    canvas: torch.Tensor,
+    full_mask: torch.Tensor,
+    boxes: dict | None = None,
+) -> torch.Tensor:
+    """
+    Fotorealistická finálna kompozícia nálepiek do fotky („digitálny útok“):
+      1. Jemný kontaktný tieň hrany papiera na pokožke (drop_shadow).
+      2. Bod 5: Viacpásmové frekvenčné Laplacian Pyramid Blending pre prirodzený prechod hrany bez švu.
+      3. Jemný svetlý lem nožnicami vystrihnutého 80g papiera.
+      4. Kalibrované optické rozmazanie objektívu webkamery (Stage 2 PSF blur prispôsobený
+         ostrosti fotky) cez nálepku a jej tesný okraj.
+      5. Prenos senzorového mikro-zrna z pôvodnej fotky na povrch nálepky.
+    Plne diferencovateľné pre optimalizáciu aj evaluáciu.
+    """
+    if full_mask.dim() == 3:
+        full_mask = full_mask.unsqueeze(1)
+    elif full_mask.dim() == 2:
+        full_mask = full_mask.view(1, 1, full_mask.shape[0], full_mask.shape[1])
+
+    b, _, h, _ = image.shape
+    s = max(1.0, float(h) / 112.0)
+    device = image.device
+
+    drop_shadow = (boxes or {}).get("drop_shadow")
+    if drop_shadow is not None:
+        ds = drop_shadow.to(device)
+        if ds.dim() == 3:
+            ds = ds.unsqueeze(1)
+        elif ds.dim() == 2:
+            ds = ds.view(1, 1, ds.shape[0], ds.shape[1])
+        img01 = torch.clamp(image * 0.5 + 0.5, 0.0, 1.0)
+        img_shaded = torch.clamp(img01 * (1.0 - ds), 0.0, 1.0) * 2.0 - 1.0
+    else:
+        img_shaded = image
+
+    # Jemný 0.5 px odlesk hrany vystrihnutého bieleho papiera
+    edge_ring = torch.clamp(4.0 * full_mask * (1.0 - full_mask), 0.0, 1.0)
+    canvas_rimmed = torch.clamp(canvas + 0.08 * edge_ring, -1.0, 1.0)
+
+    # Bod 5: Laplacian Pyramid Blending spája nálepku s pokožkou po frekvenčných pásmach
+    raw = _laplacian_pyramid_blend(
+        img_shaded,
+        canvas_rimmed,
+        full_mask,
+        sigmas=(1.4 * s, 3.8 * s),
+        mask_sigmas=(0.4 * s, 1.3 * s, 3.0 * s),
+    )
+
+    img01_ref = torch.clamp(image * 0.5 + 0.5, 0.0, 1.0)
+    ref_sig = torch.full((img01_ref.shape[0],), 1.15 * s, dtype=torch.float32, device=device)
+    img_low = _random_gaussian_blur(img01_ref, ref_sig)
+    hf_detail = (img01_ref - img_low).abs().mean(dim=(1, 2, 3)).detach()
+    psf_sigma = torch.clamp((0.68 - 7.5 * hf_detail) * s, 0.46 * s, 0.78 * s)
+    if psf_sigma.shape[0] != b:
+        psf_sigma = psf_sigma.expand(b)
+
+    blurred_raw = _random_gaussian_blur(raw, psf_sigma)
+
+    # Rozmazanie aplikujeme len na nálepku a jej tesný prechod do pokožky (zvyšok tváre ostane 100 % nedotknutý)
+    m_dil = F.max_pool2d(full_mask, kernel_size=3, stride=1, padding=1)
+    blur_halo = F.avg_pool2d(m_dil, kernel_size=3, stride=1, padding=1)
+    blur_weight = torch.clamp(blur_halo * 1.15, 0.0, 1.0)
+
+    # Prirodzené senzorové zrno webkamery z pôvodnej fotky
+    sensor_grain = (image - (img_low * 2.0 - 1.0)).detach()
+    out = (1.0 - blur_weight) * raw + blur_weight * blurred_raw + full_mask * (0.36 * sensor_grain)
+    return out.clamp(-1.0, 1.0)
 
 
 def _dct_matrix(n: int, device) -> torch.Tensor:
@@ -294,6 +630,16 @@ def _camera_pipeline(x: torch.Tensor) -> torch.Tensor:
     def gate(prob: float) -> torch.Tensor:
         return (torch.rand(b, 1, 1, 1, device=device) < prob).to(x.dtype)
 
+    # Jemná medzisnímková variácia gamutu kamery (základný matný papier Canon TS3450 sa už
+    # modeluje priamo na nálepke v _paper_albedo, takže tu neduplikujeme silnú desaturáciu tváre)
+    luma = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+    chroma_scale = 0.90 + torch.rand(b, 1, 1, 1, device=device) * 0.12
+    x_desat = luma + (x - luma) * chroma_scale
+    black_floor = -0.92 + (torch.rand(b, 1, 1, 1, device=device) * 2.0 - 1.0) * 0.05
+    white_ceil = 0.92 + (torch.rand(b, 1, 1, 1, device=device) * 2.0 - 1.0) * 0.05
+    x_inkjet = black_floor + (torch.clamp(x_desat, -1.0, 1.0) + 1.0) * 0.5 * (white_ceil - black_floor)
+    x = x * (1.0 - gate(0.50)) + x_inkjet * gate(0.50)
+
     # Rozmazanie (sigma 0..1, len 60 % vzoriek)
     sigma = torch.rand(b, device=device) * 1.0
     x_blur = _random_gaussian_blur(x, sigma)
@@ -315,7 +661,7 @@ def _camera_pipeline(x: torch.Tensor) -> torch.Tensor:
     x = x + noise * gate(0.5)
 
     # JPEG (kvalita 75-95, len 60 % vzoriek)
-    quality = 75.0 + float(torch.rand(1, device=device).item()) * 20.0
+    quality = 75.0 + float(torch.rand(1).item()) * 20.0
     x_j = _jpeg_approx(x, quality)
     x = x * (1.0 - gate(0.6)) + x_j * gate(0.6)
     return x.clamp(-1.0, 1.0)
@@ -339,7 +685,7 @@ def get_hybrid_geometry(
     landmarks: list[tuple[float, float]],
     mesh_info: dict | None = None,
     img_size: int = 112,
-    dot_radius: float = 5.5,
+    dot_radius: float = 5.0,
     dot_pattern: str = "cheeks_chin",
     strip_w_scale: float = 1.0,
     offset_x: float = 0.0,
@@ -396,18 +742,52 @@ def get_hybrid_geometry(
     arch_f = strip_place["arch"]
     arch_px = strip_place["arch_px"]
 
-    strip_mask, strip_relief, strip_shadow, strip_sheen = create_nasal_strip_mask(
-        img_size=img_size,
-        center=(strip_cy, strip_cx),
-        width=eff_w,
-        height_center=eff_hc,
-        height_wings=eff_hw,
-        angle_rad=strip_angle,
-        yaw=eff_yaw,
-        feather=0.70,
-        arch_factor=arch_f,
-        arch_drop_px=arch_px,
-    )
+    s_img = max(1.0, float(img_size) / 112.0)
+    eff_feather = 0.50 if s_img <= 1.2 else 0.72
+
+    scy_i, scx_i = int(round(strip_cy)), int(round(strip_cx))
+    arch_drop_eff = max(0.0, float(arch_f) * float(arch_px))
+    s_pad_top = int(math.ceil(eff_hw * 0.60)) + 3
+    s_pad_bot = int(math.ceil(eff_hw * 0.65 + arch_drop_eff)) + 3
+    s_pad_w = int(math.ceil(eff_w * 0.5)) + 3
+    sy1, sy2 = max(0, scy_i - s_pad_top), min(img_size, scy_i + s_pad_bot)
+    sx1, sx2 = max(0, scx_i - s_pad_w), min(img_size, scx_i + s_pad_w)
+    strip_box = (sy1, sy2, sx1, sx2)
+
+    mesh_uv_grid = None
+    if has_mesh and pts is not None and len(pts) > 278:
+        try:
+            strip_mask, strip_relief, strip_shadow, strip_sheen, mesh_uv_grid = rasterize_barycentric_nasal_strip_mesh(
+                pts_3d=pts,
+                cx=strip_cx,
+                cy=strip_cy,
+                eff_w=eff_w,
+                eff_hc=eff_hc,
+                eff_hw=eff_hw,
+                strip_angle=strip_angle,
+                arch_px=arch_px,
+                box=strip_box,
+                img_size=img_size,
+                device=device,
+                feather=eff_feather,
+            )
+        except Exception:
+            mesh_uv_grid = None
+
+    if mesh_uv_grid is None:
+        strip_mask, strip_relief, strip_shadow, strip_sheen = create_nasal_strip_mask(
+            img_size=img_size,
+            center=(strip_cy, strip_cx),
+            width=eff_w,
+            height_center=eff_hc,
+            height_wings=eff_hw,
+            angle_rad=strip_angle,
+            yaw=eff_yaw,
+            feather=eff_feather,
+            arch_factor=arch_f,
+            arch_drop_px=arch_px,
+        )
+
     strip_flat_mask, _, _, _ = create_nasal_strip_mask(
         img_size=img_size,
         center=(strip_cy, strip_cx),
@@ -416,46 +796,55 @@ def get_hybrid_geometry(
         height_wings=eff_hw,
         angle_rad=strip_angle,
         yaw=eff_yaw,
-        feather=0.70,
+        feather=eff_feather,
         arch_factor=0.0,
     )
     strip_mask = strip_mask.to(device)
     strip_flat_mask = strip_flat_mask.to(device)
     strip_relief = strip_relief.to(device)
-
-    scy_i, scx_i = int(round(strip_cy)), int(round(strip_cx))
-    s_pad_h = int(math.ceil(eff_hw * 0.65)) + 3
-    s_pad_w = int(math.ceil(eff_w * 0.5)) + 3
-    sy1, sy2 = max(0, scy_i - s_pad_h), min(img_size, scy_i + s_pad_h)
-    sx1, sx2 = max(0, scx_i - s_pad_w), min(img_size, scx_i + s_pad_w)
+    full_shadow = strip_shadow.to(device)
 
     boxes = {
-        "strip": (sy1, sy2, sx1, sx2),
+        "strip": strip_box,
         "strip_angle": float(strip_angle),
         "strip_arch": float(arch_f),
+        "strip_arch_px": float(arch_px),
         "strip_flat_mask": strip_flat_mask,
+        "strip_geom": {
+            "cx": float(strip_cx),
+            "cy": float(strip_cy),
+            "eff_w": float(eff_w),
+            "eff_hc": float(eff_hc),
+            "eff_hw": float(eff_hw),
+            "angle": float(strip_angle),
+            "yaw": float(eff_yaw),
+            "arch_drop": float(arch_drop_eff),
+            "box": strip_box,
+            "mesh_uv_grid": mesh_uv_grid,
+        },
     }
 
     # Nálepky na lícach
     r_dot = max(2.0, min(14.0, float(dot_radius)))
 
-    # Ľavé líce (stred malárnej oblasti, bezpečne mimo nosa, očí aj brady)
+    # Ľavé líce (odmerané z reálnych fotiek s 15 mm nálepkami: medzi pts[101] a pts[205])
     if has_mesh and len(pts) > 205:
         p_l = pts[205]
         p_l_in = pts[101] if len(pts) > 101 else p_l
-        lcx = float(0.72 * p_l[0] + 0.28 * p_l_in[0])
-        lcy = float(0.72 * p_l[1] + 0.28 * p_l_in[1]) - 1.0
+        lcx = float(0.65 * p_l[0] + 0.35 * p_l_in[0])
+        lcy = float(0.70 * p_l[1] + 0.30 * p_l_in[1]) + 0.8
     else:
-        lcx = lx - (nx - lx) * 0.12
-        lcy = ly + (mly - ly) * 0.44
+        lcx = lx - (nx - lx) * 0.04
+        lcy = ly + (mly - ly) * 0.46
 
     lcx = float(np.clip(lcx + offset_x + left_ox, 6.0, 106.0))
     lcy = float(np.clip(lcy + offset_y + left_oy, 6.0, 106.0))
 
     if has_mesh:
-        l_cos, l_tilt, _ = get_surface_geometry_at_coords(pts, lcx, lcy, roll)
+        l_cos_raw, l_tilt, _ = get_surface_geometry_at_coords(pts, lcx, lcy, roll)
+        l_cos = float(np.clip(l_cos_raw, 0.87, 0.96))
     else:
-        l_cos, l_tilt = 0.85, roll
+        l_cos, l_tilt = 0.90, roll
 
     l_mask, l_relief, l_sh, _ = create_elliptical_patch_mask(
         img_size=img_size,
@@ -463,9 +852,10 @@ def get_hybrid_geometry(
         radius_x=r_dot * l_cos,
         radius_y=r_dot,
         angle_rad=l_tilt,
-        feather=0.75,
+        feather=eff_feather,
     )
     l_mask, l_relief = l_mask.to(device), l_relief.to(device)
+    full_shadow = torch.maximum(full_shadow, l_sh.to(device) * 0.48)
 
     d_pad = int(math.ceil(r_dot)) + 3
     lcy_i, lcx_i = int(round(lcy)), int(round(lcx))
@@ -478,36 +868,38 @@ def get_hybrid_geometry(
     full_mask = torch.maximum(strip_mask, l_mask)
     full_relief = torch.ones_like(full_mask)
     full_relief = torch.where(strip_mask > 0.1, strip_relief, full_relief)
-    full_relief = torch.where(l_mask > 0.1, l_relief, full_relief)
+    full_relief = torch.where(l_mask > 0.1, torch.clamp(l_relief, 0.90, 1.02), full_relief)
 
-    # Pravé líce (stred malárnej oblasti, bezpečne mimo nosa, očí aj brady)
+    # Pravé líce (odmerané z reálnych fotiek s 15 mm nálepkami: medzi pts[330] a pts[425])
     if "1_cheek" not in dot_pattern and "1 nálepka" not in dot_pattern:
         if has_mesh and len(pts) > 425:
             p_r = pts[425]
             p_r_in = pts[330] if len(pts) > 330 else p_r
-            rcx = float(0.72 * p_r[0] + 0.28 * p_r_in[0])
-            rcy = float(0.72 * p_r[1] + 0.28 * p_r_in[1]) - 1.0
+            rcx = float(0.65 * p_r[0] + 0.35 * p_r_in[0])
+            rcy = float(0.70 * p_r[1] + 0.30 * p_r_in[1]) + 0.8
         else:
-            rcx = rx + (rx - nx) * 0.12
-            rcy = ry + (mry - ry) * 0.44
+            rcx = rx + (rx - nx) * 0.04
+            rcy = ry + (mry - ry) * 0.46
 
         rcx = float(np.clip(rcx + offset_x + right_ox, 6.0, 106.0))
         rcy = float(np.clip(rcy + offset_y + right_oy, 6.0, 106.0))
 
         if has_mesh:
-            r_cos, r_tilt, _ = get_surface_geometry_at_coords(pts, rcx, rcy, roll)
+            r_cos_raw, r_tilt, _ = get_surface_geometry_at_coords(pts, rcx, rcy, roll)
+            r_cos = float(np.clip(r_cos_raw, 0.87, 0.96))
         else:
-            r_cos, r_tilt = 0.85, roll
+            r_cos, r_tilt = 0.90, roll
 
-        r_mask, r_relief, _, _ = create_elliptical_patch_mask(
+        r_mask, r_relief, r_sh, _ = create_elliptical_patch_mask(
             img_size=img_size,
             center=(rcy, rcx),
             radius_x=r_dot * r_cos,
             radius_y=r_dot,
             angle_rad=r_tilt,
-            feather=0.75,
+            feather=eff_feather,
         )
         r_mask, r_relief = r_mask.to(device), r_relief.to(device)
+        full_shadow = torch.maximum(full_shadow, r_sh.to(device) * 0.48)
 
         rcy_i, rcx_i = int(round(rcy)), int(round(rcx))
         ry1, ry2 = max(0, rcy_i - d_pad), min(img_size, rcy_i + d_pad)
@@ -517,7 +909,7 @@ def get_hybrid_geometry(
         boxes.setdefault("dot_geom", {})["right_dot"] = (rcx, rcy, float(r_cos), float(r_tilt))
 
         full_mask = torch.maximum(full_mask, r_mask)
-        full_relief = torch.where(r_mask > 0.1, r_relief, full_relief)
+        full_relief = torch.where(r_mask > 0.1, torch.clamp(r_relief, 0.90, 1.02), full_relief)
 
     # Brada (posunutá o -3 px vyššie do labiomentálnej ryhy, aby sa neorezávala o spodný okraj)
     if "brada" in dot_pattern.lower() or "chin" in dot_pattern.lower() or "3 nálepk" in dot_pattern:
@@ -536,15 +928,16 @@ def get_hybrid_geometry(
         else:
             c_cos, c_tilt = 0.88, roll
 
-        c_mask, c_relief, _, _ = create_elliptical_patch_mask(
+        c_mask, c_relief, c_sh, _ = create_elliptical_patch_mask(
             img_size=img_size,
             center=(ccy, ccx),
             radius_x=r_dot * c_cos,
             radius_y=r_dot,
             angle_rad=c_tilt,
-            feather=0.75,
+            feather=0.85,
         )
         c_mask, c_relief = c_mask.to(device), c_relief.to(device)
+        full_shadow = torch.maximum(full_shadow, c_sh.to(device) * 0.75)
 
         ccy_i, ccx_i = int(round(ccy)), int(round(ccx))
         cy1, cy2 = max(0, ccy_i - d_pad), min(img_size, ccy_i + d_pad)
@@ -558,6 +951,8 @@ def get_hybrid_geometry(
         boxes["chin_mask"] = c_mask
         boxes["chin_relief"] = c_relief
 
+    full_mask = torch.clamp(full_mask, 0.0, 1.0)
+    boxes["drop_shadow"] = torch.clamp(full_shadow * (1.0 - full_mask), 0.0, 0.25)
     boxes["strip_mask"] = strip_mask
     boxes["strip_relief"] = strip_relief
     boxes["strip_w_scale"] = float(strip_w_scale)
@@ -568,7 +963,6 @@ def get_hybrid_geometry(
         boxes["right_mask"] = r_mask
         boxes["right_relief"] = r_relief
 
-    full_mask = torch.clamp(full_mask, 0.0, 1.0)
     return full_mask, full_relief, boxes
 
 
@@ -579,6 +973,7 @@ def generate_printable_sheet(
     landmarks=None,
     masks: dict | None = None,
     geometry: dict | None = None,
+    max_sets: int = 3,
 ) -> np.ndarray:
     """
     Generuje tlačový hárok (300 DPI) v presnej mierke (100% Actual Size).
@@ -613,36 +1008,15 @@ def generate_printable_sheet(
     mm_per_px = float(mm_per_px)
 
     def _render_flat_dot(key, rgb_tex, geo, flat):
-        """Nálepka ako ROVNÝCH KRUH. Textura, ktorú model videl, leží na naklonenom
-        povrchu (elipsa). Tu sa inverzne zobrazí: pre každý bod rovného kruhu sa
-        vypočíta, kam dopadol v obraze (M = skrátenie o cos pozdĺž osi sklonu) a odtiaľ
-        sa vzáme farba. Orientácia („hore“) ostane ako na tvári, odstráni sa len
-        perspektívne skrátenie."""
-        img_size = 112
-        y1, y2, x1, x2 = flat["box"]
-        py1, py2 = max(0, y1), min(img_size, y2)
-        px1, px2 = max(0, x1), min(img_size, x2)
-        ch, cw = py2 - py1, px2 - px1
-        th_, tw_ = rgb_tex.shape[0], rgb_tex.shape[1]
+        """Textúra kruhovej nálepky je už natívne parametrizovaná v plochých papierových súradniciach."""
         r_img = float(flat["r"])
         d_mm = 2.0 * r_img * mm_per_px
-        margin_mm = 1.0
-        side = max(8, int(round((d_mm + 2.0 * margin_mm) * MM_TO_PX)))
+        side = max(8, int(round(d_mm * MM_TO_PX)))
+        flat_rgb = cv2.resize(rgb_tex, (side, side), interpolation=cv2.INTER_CUBIC)
         c = (side - 1) / 2.0
-        s = (d_mm * MM_TO_PX / 2.0) / r_img            # rovné px na 1 px obrazu
         jj, ii = np.meshgrid(np.arange(side, dtype=np.float32), np.arange(side, dtype=np.float32))
-        fx, fy = (jj - c) / s, (ii - c) / s             # súrdnice v px obrazu (rovný kruh)
-        a = float(flat["tilt"]); cs = float(flat["cos"])
-        ux, uy, vx, vy = math.cos(a), math.sin(a), -math.sin(a), math.cos(a)
-        fu, fv = fx * ux + fy * uy, fx * vx + fy * vy
-        sx = cs * fu * ux + fv * vx                     # posun v obraze
-        sy = cs * fu * uy + fv * vy
-        map_x = ((flat["cx"] + sx - px1 + 0.5) * tw_ / cw - 0.5).astype(np.float32)
-        map_y = ((flat["cy"] + sy - py1 + 0.5) * th_ / ch - 0.5).astype(np.float32)
-        flat_rgb = cv2.remap(rgb_tex, map_x, map_y, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-        dist = np.sqrt(fx * fx + fy * fy) / r_img
-        alpha = np.clip((1.0 - dist) * (r_img / 0.75) + 0.5, 0.0, 1.0)
-        alpha = (alpha * 255.0).astype(np.uint8)
+        dist = np.sqrt((jj - c) ** 2 + (ii - c) ** 2) / max(1.0, side * 0.5)
+        alpha = (np.clip((1.0 - dist) * 16.0 + 0.5, 0.0, 1.0) * 255.0).astype(np.uint8)
         return {
             "key": key,
             "rgb": np.ascontiguousarray(flat_rgb),
@@ -740,15 +1114,15 @@ def generate_printable_sheet(
     sheet = np.ones((sheet_h, sheet_w, 3), dtype=np.uint8) * 255
 
     strip_geo = geometry.get("strip", {}) or {}
-    strip_w_sc = float(strip_geo.get("strip_w_scale", 1.15))
-    strip_scale_ratio = float(np.clip(strip_w_sc / 1.15, 0.75, 1.35))
+    strip_w_sc = float(strip_geo.get("strip_w_scale", 1.0))
+    strip_scale_ratio = float(np.clip(strip_w_sc, 0.75, 1.35))
     eff_strip_len_mm = STRIP_LEN_MM * strip_scale_ratio
     eff_strip_waist_mm = STRIP_WAIST_MM * strip_scale_ratio
     eff_strip_wings_mm = STRIP_WINGS_MM * strip_scale_ratio
 
     dot_geo_any = geometry.get("left_dot") or geometry.get("right_dot") or {}
-    r_dot_eff_val = float(dot_geo_any.get("dot_radius_eff", 5.5))
-    eff_dot_diam_mm = DOT_DIAM_MM * float(np.clip(r_dot_eff_val / 5.5, 0.65, 1.50))
+    r_dot_eff_val = float(dot_geo_any.get("dot_radius_eff", 5.0))
+    eff_dot_diam_mm = DOT_DIAM_MM * float(np.clip(r_dot_eff_val / 5.0, 0.65, 1.50))
 
     # Kalibračné meradlo (50 mm)
     bar_x, bar_y = 100, 120
@@ -771,20 +1145,44 @@ def generate_printable_sheet(
         cv2.FONT_HERSHEY_SIMPLEX, 0.40, (90, 90, 90), 1, cv2.LINE_AA,
     )
 
+    def _canon_ts3450_precompensate(rgb_u8: np.ndarray) -> np.ndarray:
+        """Pred-kompenzácia pre atramentovú tlačiareň Canon PIXMA TS3450 (PG-545 / CL-546)
+        na bežný A4 papier: S-krivka kontrastu + 1.18x sýtosť + jemné doostrenie hrán."""
+        x = rgb_u8.astype(np.float32) / 255.0
+        # 1. S-krivka kontrastu proti vsakovaniu atramentu do papiera
+        x_centered = (x - 0.5) * 1.16
+        x_scurve = np.clip(0.5 + x_centered / np.sqrt(1.0 + 0.32 * (x_centered ** 2)), 0.0, 1.0)
+        # 2. Zvýšenie farebnej sýtosti (kompenzácia CMY dye desaturácie na matnom papieri)
+        luma = 0.299 * x_scurve[..., 0:1] + 0.587 * x_scurve[..., 1:2] + 0.114 * x_scurve[..., 2:3]
+        x_sat = np.clip(luma + (x_scurve - luma) * 1.18, 0.0, 1.0)
+        out_u8 = np.clip(x_sat * 255.0, 0, 255).astype(np.uint8)
+        # 3. Jemný Unsharp Mask proti rozpíjaniu kvapiek atramentu (dot gain)
+        blur = cv2.GaussianBlur(out_u8, (0, 0), sigmaX=1.0)
+        return cv2.addWeighted(out_u8, 1.22, blur, -0.22, 0)
+
     def _to_rgb(t):
         if isinstance(t, np.ndarray):
-            return t if t.dtype == np.uint8 else np.clip(t * 255.0, 0, 255).astype(np.uint8)
+            raw = t if t.dtype == np.uint8 else np.clip(t * 255.0, 0, 255).astype(np.uint8)
+            return _canon_ts3450_precompensate(raw)
         if isinstance(t, torch.Tensor):
             p = t.detach().squeeze()
             if p.dim() == 3:
                 p = p.permute(1, 2, 0)
             p_np = p.cpu().numpy()
             if p_np.min() < -0.05:
-                return np.clip((p_np + 1.0) * 0.5 * 255.0, 0, 255).astype(np.uint8)
-            return np.clip(p_np * 255.0, 0, 255).astype(np.uint8)
+                raw = np.clip((p_np + 1.0) * 0.5 * 255.0, 0, 255).astype(np.uint8)
+            else:
+                raw = np.clip(p_np * 255.0, 0, 255).astype(np.uint8)
+            return _canon_ts3450_precompensate(raw)
         return np.zeros((96, 96, 3), dtype=np.uint8)
 
-    def _extract_active_strip_tex(tex_rgb):
+    def _extract_active_strip_tex(tex_rgb, out_w=None, out_h=None):
+        flat_s = (geometry.get("strip") or {}).get("flat_strip")
+        if flat_s is not None and out_w is not None and out_h is not None:
+            # Textúra pásky (96x256) je optimalizovaná priamo v plochých papierových súradniciach
+            # a počas forward passu sa 3D ovíja na nos cez _warp_flat_strip_to_box -> 1:1 bez orezu!
+            return cv2.resize(tex_rgb, (out_w, out_h), interpolation=cv2.INTER_CUBIC)
+
         m = masks.get("strip") if masks else None
         if m is None:
             return tex_rgb
@@ -811,26 +1209,7 @@ def generate_printable_sheet(
     def _extract_active_dot_tex(tex_rgb, key, D):
         flat = (geometry.get(key) or {}).get("flat")
         if flat is not None:
-            img_size = 112
-            y1, y2, x1, x2 = flat["box"]
-            py1, py2 = max(0, y1), min(img_size, y2)
-            px1, px2 = max(0, x1), min(img_size, x2)
-            ch, cw = max(1, py2 - py1), max(1, px2 - px1)
-            th_, tw_ = tex_rgb.shape[0], tex_rgb.shape[1]
-            r_img = max(1.0, float(flat["r"]))
-            c = (D - 1) / 2.0
-            s = (D / 2.0) / r_img
-            jj, ii = np.meshgrid(np.arange(D, dtype=np.float32), np.arange(D, dtype=np.float32))
-            fx, fy = (jj - c) / s, (ii - c) / s
-            a = float(flat["tilt"])
-            cs = float(flat["cos"])
-            ux, uy, vx, vy = math.cos(a), math.sin(a), -math.sin(a), math.cos(a)
-            fu, fv = fx * ux + fy * uy, fx * vx + fy * vy
-            sx = cs * fu * ux + fv * vx
-            sy = cs * fu * uy + fv * vy
-            map_x = ((flat["cx"] + sx - px1 + 0.5) * tw_ / cw - 0.5).astype(np.float32)
-            map_y = ((flat["cy"] + sy - py1 + 0.5) * th_ / ch - 0.5).astype(np.float32)
-            return cv2.remap(tex_rgb, map_x, map_y, cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            return cv2.resize(tex_rgb, (D, D), interpolation=cv2.INTER_CUBIC)
         m = masks.get(key) if masks else None
         if m is not None:
             m_arr = np.asarray(m, dtype=np.float32)
@@ -862,9 +1241,8 @@ def generate_printable_sheet(
         pts_top = []
         pts_bot = []
         for x in xs:
-            u = x / x_limit
-            s = 0.5 * (1.0 - math.cos(abs(u) * math.pi))
-            h_local = Hc + (Hw - Hc) * (s ** 1.1)
+            u = abs(x / x_limit)
+            h_local = Hc + (Hw - Hc) * (u ** 1.75)
             pts_top.append((int(round(cx + x)), int(round(cy - h_local * 0.5))))
             pts_bot.append((int(round(cx + x)), int(round(cy + h_local * 0.5))))
 
@@ -879,8 +1257,8 @@ def generate_printable_sheet(
         pts_arr = np.array(pts_all, dtype=np.int32)
         cv2.fillPoly(canvas, [pts_arr], 255)
 
-        active_strip_rgb = _extract_active_strip_tex(tex_rgb)
-        tex_res = cv2.resize(active_strip_rgb, (W, Hw), interpolation=cv2.INTER_CUBIC)
+        active_strip_rgb = _extract_active_strip_tex(tex_rgb, out_w=W, out_h=Hw)
+        tex_res = active_strip_rgb if active_strip_rgb.shape[:2] == (Hw, W) else cv2.resize(active_strip_rgb, (W, Hw), interpolation=cv2.INTER_CUBIC)
 
         a_norm = (canvas.astype(np.float32) / 255.0)[:, :, np.newaxis]
         target_roi = sheet[y_pos:y_pos + Hw, x_pos:x_pos + W].astype(np.float32)
@@ -933,7 +1311,7 @@ def generate_printable_sheet(
             ("SADA 1 (hlavna)", 280),
             ("SADA 2 (rezerva)", 760),
             ("SADA 3 (rezerva)", 1240),
-        ]
+        ][:max(1, int(max_sets))]
         for name, y_row in rows:
             cv2.putText(sheet, name, (100, y_row - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (40, 40, 40), 1, cv2.LINE_AA)
             cx = 100
@@ -1032,6 +1410,7 @@ def build_printable_payload(boxes: dict, spec_items: dict, mm_per_px: float):
             geo[key] = {"mm_w": (x2 - x1) * mm_per_px * 1.14, "mm_h": (y2 - y1) * mm_per_px,
                         "unsquash": 1.14, "rotate_deg": -math.degrees(strip_angle),
                         "strip_w_scale": strip_w_scale,
+                        "flat_strip": boxes.get("strip_geom"),
                         "label": labels[key]}
         else:
             geo[key] = {"mm_w": 2.0 * r_dot_eff * mm_per_px, "mm_h": 2.0 * r_dot_eff * mm_per_px,
@@ -1343,8 +1722,8 @@ def hybrid_patch_attack(
 
     B, C, H, W = image.shape
 
-    patch_blend_factor = 0.88 if is_rgb else 0.85
-    gain_full = _illumination_gain(image).detach()
+    patch_blend_factor = 0.93 if is_rgb else 0.88
+    gain_full = _illumination_gain(image, boxes=boxes).detach()
     mask_b = full_mask.expand(B, -1, -1, -1) if full_mask.shape[0] != B else full_mask
 
     for _ in range(num_iter):
@@ -1366,9 +1745,8 @@ def hybrid_patch_attack(
                 _prep_tex(torch.clamp(base_dots + delta_chin * delta_scale_dots, -1.0, 1.0), "chin_dot"),
                 (cy1, cy2, cx1, cx2), TEX_DOT_SIZE)
 
-        # Zložený patch (osvetlenie * reliéf * priehľadnosť materiálu) sa diferencovateľne
-        # downsample-uje do boxu, takže model vidí presne to, čo sa neskôr tlačí.
-        canvas, _ = _build_canvas(image, region_specs, gain_full, full_relief, patch_blend_factor)
+        # Zložený patch (3D ovinutie + osvetlenie scény + reliéf + priehľadnosť papiera)
+        canvas, _ = _build_canvas(image, region_specs, gain_full, full_relief, patch_blend_factor, boxes=boxes)
 
         if eot:
             # Geometria: perspektívna homografia z rohových offsetov + rotácia/translácia/škála
@@ -1391,9 +1769,9 @@ def hybrid_patch_attack(
             with torch.no_grad():
                 base_emb = model(_camera_pipeline(trans_image.contiguous())).detach()
             emb_eot = model(adv_eot.contiguous())
-            # Čistý digitálny člen: patch na neposunutej tvári, aby útok ostal silný
-            # aj bez fyzickej transformácie a final_sim na čistom obrázku klesol.
-            emb_clean = model(((1.0 - full_mask) * image + full_mask * canvas).contiguous())
+            # Čistý digitálny člen (vrátane tieňa hrany papiera a optického rozmazania fotky)
+            clean_comp = composite_realistic_stickers(image, canvas, full_mask, boxes=boxes)
+            emb_clean = model(clean_comp.contiguous())
             if target_emb is not None:
                 tgt = target_emb.expand(emb_eot.shape[0], -1) if target_emb.shape[0] != emb_eot.shape[0] else target_emb
                 sim = 0.5 * F.cosine_similarity(tgt, emb_eot).mean() + 0.5 * F.cosine_similarity(target_emb, emb_clean).mean()
@@ -1402,7 +1780,7 @@ def hybrid_patch_attack(
                 sim = 0.5 * F.cosine_similarity(base_emb, emb_eot).mean() + 0.5 * F.cosine_similarity(orig_emb, emb_clean).mean()
                 loss = sim
         else:
-            adv_img = ((1.0 - full_mask) * image + full_mask * canvas).contiguous()
+            adv_img = composite_realistic_stickers(image, canvas, full_mask, boxes=boxes).contiguous()
             adv_emb = model(adv_img)
             if target_emb is not None:
                 sim = F.cosine_similarity(target_emb, adv_emb).mean()
@@ -1467,9 +1845,8 @@ def hybrid_patch_attack(
                 _prep_tex(torch.clamp(base_dots + delta_chin * delta_scale_dots, -1.0, 1.0), "chin_dot"),
                 (cy1, cy2, cx1, cx2), TEX_DOT_SIZE)
 
-        final_canvas, final_comps = _build_canvas(image, final_specs, gain_full, full_relief, patch_blend_factor)
-        final_adv_img = (1.0 - full_mask) * image + full_mask * final_canvas
-        final_adv_img = final_adv_img.clamp(-1.0, 1.0)
+        final_canvas, final_comps = _build_canvas(image, final_specs, gain_full, full_relief, patch_blend_factor, boxes=boxes)
+        final_adv_img = composite_realistic_stickers(image, final_canvas, full_mask, boxes=boxes)
 
         final_emb = model(final_adv_img)
         if target_emb is not None:
