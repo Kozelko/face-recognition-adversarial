@@ -582,18 +582,24 @@ def extract_base_patch_coords(landmarks, mesh, nose_is_dot=False, strip_scale=1.
         strip_y = float(place["cy"]) * 2.0
 
     if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 205:
-        left_x = float(mesh["points_3d"][205][0]) * 2.0
-        left_y = (float(mesh["points_3d"][205][1]) - 1.5) * 2.0
+        pts = mesh["points_3d"]
+        p_l = pts[205]
+        p_l_in = pts[101] if len(pts) > 101 else p_l
+        left_x = float(0.65 * p_l[0] + 0.35 * p_l_in[0]) * 2.0
+        left_y = (float(0.70 * p_l[1] + 0.30 * p_l_in[1]) + 0.8) * 2.0
     else:
-        left_x = (lx - (nx - lx) * 0.12) * 2.0
-        left_y = (ly + (ny - ly) * 0.45) * 2.0
+        left_x = (lx - (nx - lx) * 0.04) * 2.0
+        left_y = (ly + (ny - ly) * 0.46) * 2.0
 
     if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 425:
-        right_x = float(mesh["points_3d"][425][0]) * 2.0
-        right_y = (float(mesh["points_3d"][425][1]) - 1.5) * 2.0
+        pts = mesh["points_3d"]
+        p_r = pts[425]
+        p_r_in = pts[330] if len(pts) > 330 else p_r
+        right_x = float(0.65 * p_r[0] + 0.35 * p_r_in[0]) * 2.0
+        right_y = (float(0.70 * p_r[1] + 0.30 * p_r_in[1]) + 0.8) * 2.0
     else:
-        right_x = (rx + (rx - nx) * 0.12) * 2.0
-        right_y = (ry + (ny - ry) * 0.45) * 2.0
+        right_x = (rx + (rx - nx) * 0.04) * 2.0
+        right_y = (ry + (ny - ry) * 0.46) * 2.0
 
     if mesh and "points_3d" in mesh and len(mesh["points_3d"]) > 175:
         chin_x = float(mesh["points_3d"][175][0]) * 2.0
@@ -865,25 +871,25 @@ window.initFaceDragOverlay = function(imgEl) {
                 ctx.shadowColor = h.color;
                 ctx.shadowBlur = isHover ? 8 : 2;
 
-                const sScale = parseFloat(state.offsets.strip_scale) || 1.15;
-                // Presná veľkosť a náklon pásky z backendu (aby obrys sedel 1:1 s vykreslenou páskou)
+                const sScale = parseFloat(state.offsets.strip_scale) || 1.0;
+                // Presná 3D veľkosť, klenutie (∩) a náklon pásky z backendu (aby obrys sedel 1:1 s vykreslenou páskou)
                 const wPx = parseFloat(state.offsets.strip_w_px) || 0;
                 const hPx = parseFloat(state.offsets.strip_h_px) || 0;
-                const sw = wPx > 0 ? wPx : Math.round(37 * sScale);
-                const sh = hPx > 0 ? hPx : Math.round(11 * sScale);
-                const arch = Math.round(4.2 * sScale);
+                const sw = wPx > 0 ? wPx : Math.round(44 * sScale);
+                const sh = Math.round(13 * sScale);
+                const arch = parseFloat(state.offsets.strip_arch_px) || Math.round(9.5 * sScale);
                 const sAng = (parseFloat(state.offsets.strip_angle_deg) || 0) * Math.PI / 180.0;
                 const xL = -sw/2, xR = sw/2;
-                const yTop = -sh/2 - arch * 0.35, yBot = sh/2 - arch * 0.35;
+                const yTop = -sh/2, yBot = sh/2;
 
                 ctx.save();
                 ctx.translate(h.x, h.y);
                 ctx.rotate(sAng);
                 ctx.beginPath();
                 ctx.moveTo(xL, yTop + arch);
-                ctx.quadraticCurveTo(0, yTop - arch * 0.85, xR, yTop + arch);
+                ctx.quadraticCurveTo(0, yTop - arch, xR, yTop + arch);
                 ctx.lineTo(xR, yBot + arch);
-                ctx.quadraticCurveTo(0, yBot - arch * 0.85, xL, yBot + arch);
+                ctx.quadraticCurveTo(0, yBot - arch, xL, yBot + arch);
                 ctx.closePath();
                 ctx.fill();
                 ctx.stroke();
@@ -893,7 +899,7 @@ window.initFaceDragOverlay = function(imgEl) {
                 ctx.font = "bold 9px monospace";
                 ctx.fillStyle = h.color;
                 ctx.textAlign = "center";
-                ctx.fillText(h.short, h.x, h.y + yTop - arch * 0.5 - 3);
+                ctx.fillText(h.short, h.x, h.y + yTop - 4);
             } else {
                 ctx.fillStyle = isHover ? "rgba(213, 0, 249, 0.25)" : "rgba(0, 0, 0, 0.05)";
                 ctx.strokeStyle = h.color;
@@ -902,7 +908,7 @@ window.initFaceDragOverlay = function(imgEl) {
                 ctx.shadowColor = h.color;
                 ctx.shadowBlur = isHover ? 8 : 2;
 
-                const dRad = parseFloat(state.offsets.patch_radius) || 5.5;
+                const dRad = parseFloat(state.offsets.patch_radius) || 4.6;
                 const pr = (dRad * 2.0) + (isHover ? 1.5 : 0.0);
                 ctx.beginPath();
                 ctx.arc(h.x, h.y, pr, 0, Math.PI * 2);
@@ -1194,6 +1200,7 @@ def render_live_placement_preview(
         cur_dots_pct = 0.0
         strip_box_px = None
         strip_angle_deg = 0.0
+        strip_arch_canvas_px = 9.5
 
         # Športová páska na nos (Breathe Right)
         if attack_name == "Športová páska na nos (Breathe Right)":
@@ -1209,6 +1216,7 @@ def render_live_placement_preview(
             r_np = relief.squeeze().cpu().numpy()
             strip_box_px = _mask_bbox_px(m_np)
             strip_angle_deg = float(place["angle"]) * 180.0 / math.pi
+            strip_arch_canvas_px = float(place["arch_px"]) * float(place["arch"]) * 2.0
 
             cur_tot_pct = float(mask.sum().item()) / (112.0 * 112.0) * 100.0
             cur_strip_pct = cur_tot_pct
@@ -1290,7 +1298,7 @@ def render_live_placement_preview(
                 landmarks=lms,
                 mesh_info=mesh,
                 img_size=112,
-                dot_radius=float(patch_radius) if patch_radius else 5.5,
+                dot_radius=float(patch_radius) if patch_radius else 5.0,
                 dot_pattern=dot_pat,
                 strip_w_scale=s_w_scale,
                 offset_x=0.0,
@@ -1308,32 +1316,52 @@ def render_live_placement_preview(
             strip_r = boxes["strip_relief"]
             sm_np = strip_m.squeeze().cpu().numpy()
             sr_np = strip_r.squeeze().cpu().numpy()
+            fr_np = f_relief.squeeze().cpu().numpy()
+            ds_np = boxes["drop_shadow"].squeeze().cpu().numpy() if "drop_shadow" in boxes else np.zeros_like(sm_np)
             strip_box_px = _mask_bbox_px(sm_np)
             strip_angle_deg = float(boxes.get("strip_angle", 0.0)) * 180.0 / math.pi
+            strip_arch_canvas_px = float(boxes.get("strip_arch_px", 6.8)) * float(boxes.get("strip_arch", 1.0)) * 2.0
             p_low = str(patch_pos).lower()
             if "rgb" in p_low or "farebn" in p_low or "art" in p_low:
-                s_col = np.array([235, 90, 50], dtype=np.float32)
-                d_col = np.array([60, 175, 245], dtype=np.float32)
+                s_col = np.array([210, 110, 82], dtype=np.float32)
+                d_col = np.array([92, 165, 215], dtype=np.float32)
             elif "karbón" in p_low or "carbon" in p_low or "čierna" in p_low or "athlete" in p_low:
-                s_col = np.array([32, 34, 38], dtype=np.float32)
-                d_col = np.array([36, 38, 42], dtype=np.float32)
+                s_col = np.array([52, 54, 60], dtype=np.float32)
+                d_col = np.array([55, 58, 64], dtype=np.float32)
             elif "telová" in p_low or "tan" in p_low:
-                s_col = np.array([210, 168, 125], dtype=np.float32)
-                d_col = np.array([220, 185, 145], dtype=np.float32)
+                s_col = np.array([205, 166, 126], dtype=np.float32)
+                d_col = np.array([214, 180, 142], dtype=np.float32)
             elif "priesvitná" in p_low or "clear" in p_low:
-                s_col = np.array([225, 225, 230], dtype=np.float32)
-                d_col = np.array([220, 185, 145], dtype=np.float32)
+                s_col = np.array([220, 222, 228], dtype=np.float32)
+                d_col = np.array([214, 180, 142], dtype=np.float32)
             else:
-                s_col = np.array([32, 34, 38], dtype=np.float32)
-                d_col = np.array([36, 38, 42], dtype=np.float32)
+                s_col = np.array([52, 54, 60], dtype=np.float32)
+                d_col = np.array([55, 58, 64], dtype=np.float32)
 
-            for c in range(3):
-                canvas[:, :, c] = np.clip((1.0 - sm_np) * canvas[:, :, c] + sm_np * s_col[c] * sr_np, 0, 255).astype(np.uint8)
+            # Lokálne smerové tieňovanie nosa (sigma 1.25) + makro-osvetlenie líc (sigma 2.8) + PSF kamery
+            illum_nose = cv2.GaussianBlur(canvas.astype(np.float32) / 255.0, (7, 7), sigmaX=1.25)
+            illum_cheek = cv2.GaussianBlur(canvas.astype(np.float32) / 255.0, (13, 13), sigmaX=2.8)
+            lum_n = 0.299 * illum_nose[:, :, 0] + 0.587 * illum_nose[:, :, 1] + 0.114 * illum_nose[:, :, 2]
+            lum_c = 0.299 * illum_cheek[:, :, 0] + 0.587 * illum_cheek[:, :, 1] + 0.114 * illum_cheek[:, :, 2]
+            ref_l = max(0.14, float(lum_n[28:76, 26:86].mean() + 0.75 * lum_n[28:76, 26:86].std()))
+            exp_s = float(np.clip(ref_l / 0.58, 0.52, 1.08))
+            gain_n = np.clip(lum_n / ref_l, 0.36, 1.06) * exp_s
+            gain_c = np.clip(0.34 + 0.66 * (lum_c / ref_l), 0.54, 1.06) * exp_s
 
+            canvas_f = canvas.astype(np.float32) * (1.0 - ds_np[:, :, None])
             dot_mask = torch.clamp(f_mask - strip_m.to(f_mask.device), 0.0, 1.0)
             dm_np = dot_mask.squeeze().cpu().numpy()
+            fm_np = f_mask.squeeze().cpu().numpy()
+
             for c in range(3):
-                canvas[:, :, c] = np.clip((1.0 - dm_np * 0.90) * canvas[:, :, c] + dm_np * 0.90 * d_col[c], 0, 255).astype(np.uint8)
+                lit_s = s_col[c] * gain_n * sr_np
+                canvas_f[:, :, c] = (1.0 - sm_np * 0.93) * canvas_f[:, :, c] + (sm_np * 0.93) * lit_s
+                lit_d = d_col[c] * gain_c * fr_np
+                canvas_f[:, :, c] = (1.0 - dm_np * 0.93) * canvas_f[:, :, c] + (dm_np * 0.93) * lit_d
+
+            psf_blur = cv2.GaussianBlur(canvas_f, (5, 5), sigmaX=0.52)
+            halo_w = np.clip(cv2.GaussianBlur(fm_np, (3, 3), sigmaX=0.7) * 1.15, 0.0, 1.0)[:, :, None]
+            canvas = np.clip((1.0 - halo_w) * canvas_f + halo_w * psf_blur, 0, 255).astype(np.uint8)
 
             cur_tot_pct = float(f_mask.sum().item()) / (112.0 * 112.0) * 100.0
             cur_strip_pct = float(strip_m.sum().item()) / (112.0 * 112.0) * 100.0
@@ -1356,6 +1384,7 @@ def render_live_placement_preview(
             "strip_w_px": strip_box_px[0] if strip_box_px else 0.0,
             "strip_h_px": strip_box_px[1] if strip_box_px else 0.0,
             "strip_angle_deg": strip_angle_deg,
+            "strip_arch_px": strip_arch_canvas_px,
             # Rozsah posunu, do ktorého JS drží úchytky (aby sa úchytka nikdy
             # nedostala mimo rozsah sliderov) – jeden zdroj pravdy s backendom.
             "offset_limit": OFFSET_LIMIT_PX,
@@ -2211,18 +2240,18 @@ with gr.Blocks(title="Face Recognition & Adversarial Attacks") as app:
                         strip_scale_slider = gr.Slider(
                             minimum=0.7,
                             maximum=1.50,
-                            value=1.15,
+                            value=1.0,
                             step=0.05,
-                            label="Veľkosť pásky na nos (1.0 = reálna Breathe Right)",
+                            label="Veľkosť pásky na nos (1.0 = reálna 58 mm Breathe Right)",
                             scale=2,
                             visible=True
                         )
                         patch_radius_slider = gr.Slider(
                             minimum=2.5,
                             maximum=7.5,
-                            value=5.5,
-                            step=0.5,
-                            label="Veľkosť nálepiek na lícach (Polomer px)",
+                            value=4.6,
+                            step=0.2,
+                            label="Veľkosť nálepiek na lícach (4.6 px = 15 mm kruh)",
                             scale=2,
                             visible=True
                         )
