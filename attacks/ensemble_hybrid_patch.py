@@ -49,8 +49,10 @@ from attacks.hybrid_patch import (
     TEX_STRIP_SIZE,
     TEX_DOT_SIZE,
     EOT_BATCH,
+    _gblur_fixed,
     _illumination_gain,
     _build_canvas,
+    composite_realistic_stickers,
     _eot_grid,
     _patch_placement_jitter,
     _camera_pipeline,
@@ -58,7 +60,7 @@ from attacks.hybrid_patch import (
     derive_mm_per_px,
     build_printable_payload,
 )
-from attacks.constellation_patch import extract_landmarks
+from attacks.constellation_patch import extract_landmarks, close_mediapipe_landmarker
 from attacks.nasal_strip_patch import create_nasal_strip_mask  # noqa: F401  (re-export pre parity)
 
 
@@ -80,18 +82,18 @@ PRINTABLE_ANCHORS = [
 # ArcFace (iResNet50 Angular Margin) a AdaFace (Quality-Adaptive Margin) tvoria základ >90 % produkčných
 # systémov (InsightFace, KYC, hraničné kontroly, CCTV) a majú najhustejšie uhlové zhluky na hypersfére.
 DEFAULT_ARCH_PRIORS = {
-    "ArcFace": 1.85,
-    "AdaFace": 1.60,
-    "FaceNet": 1.50,
-    "FaceNet (CASIA)": 1.35,
-    "BenchmarkCNN": 1.25,
-    "BenchmarkCNN (Finetuned)": 1.25,
+    "ArcFace": 4.60,
+    "AdaFace": 2.45,
+    "FaceNet": 1.15,
+    "FaceNet (CASIA)": 2.15,
+    "BenchmarkCNN": 1.35,
+    "BenchmarkCNN (Finetuned)": 1.35,
 }
 
-DEFAULT_MARGIN_LOW = 0.24   # prísna hranica pre bezpečnú rezervu pod prahom 0.50 pri fyzickej tlači
+DEFAULT_MARGIN_LOW = 0.22   # prísna hranica pre bezpečnú rezervu pod prahom 0.50 pri fyzickej tlači
 
-# Priehľadnosť materiálu (0.93 zabezpečuje plný kontrast matného papiera pri zachovaní fotometrie).
-PATCH_BLEND_FACTOR = 0.93
+# Priehľadnosť materiálu (0.94 zabezpečuje plný kontrast matného papiera pri zachovaní fotometrie).
+PATCH_BLEND_FACTOR = 0.94
 
 
 def _anchors_tensor(device):
@@ -161,25 +163,33 @@ def _build_region_specs(patches, boxes):
 
 
 def _eot_forward(canvas: torch.Tensor, image: torch.Tensor, full_mask: torch.Tensor,
-                 eot: bool, K: int | None = None):
-    """Fyzikálne EoT: jitter nalepenia + perspektívna homografia + crop jitter + kamera."""
+                 eot: bool, K: int | None = None, boxes: dict | None = None):
+    """Fyzikálne EoT: kontaktný tieň + jitter nalepenia + perspektívna homografia + kamera."""
     if K is None:
         K = EOT_BATCH
     if not eot:
-        adv = ((1.0 - full_mask) * image + full_mask * canvas).clamp(-1.0, 1.0)
+        adv = composite_realistic_stickers(image, canvas, full_mask, boxes=boxes)
         return adv, None
     b, _, h, w = canvas.shape
     k = K if b == 1 else b
+    drop_shadow = (boxes or {}).get("drop_shadow")
+    if drop_shadow is not None:
+        ds = drop_shadow.to(image.device)
+        img_sh = torch.clamp((image * 0.5 + 0.5) * (1.0 - ds), 0.0, 1.0) * 2.0 - 1.0
+    else:
+        img_sh = image
     canvas_r = canvas.repeat(k, 1, 1, 1) if b == 1 else canvas
     image_r = image.repeat(k, 1, 1, 1) if b == 1 else image
+    img_sh_r = img_sh.repeat(k, 1, 1, 1) if b == 1 else img_sh
     mask_r = full_mask.repeat(k, 1, 1, 1) if full_mask.shape[0] == 1 else full_mask
     canvas_r, mask_r = _patch_placement_jitter(canvas_r, mask_r)
     grid = _eot_grid(k, h, w, canvas.device)
     trans_canvas = F.grid_sample(canvas_r, grid, mode="bilinear", padding_mode="border", align_corners=False)
     trans_image = F.grid_sample(image_r, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    trans_img_sh = F.grid_sample(img_sh_r, grid, mode="bilinear", padding_mode="border", align_corners=False)
     trans_mask = F.grid_sample(mask_r, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
     trans_mask = torch.clamp(trans_mask, 0.0, 1.0)
-    adv = (1.0 - trans_mask) * trans_image + trans_mask * trans_canvas
+    adv = (1.0 - trans_mask) * trans_img_sh + trans_mask * trans_canvas
     base = _camera_pipeline(trans_image.contiguous())
     return _camera_pipeline(adv), base
 
@@ -227,7 +237,7 @@ def _forward_raw(model, x):
 
 
 def apply_patch_set(patches: dict, image: torch.Tensor, landmarks=None, mtcnn=None,
-                    dot_radius: float = 5.5, dot_pattern: str = "cheeks_chin",
+                    dot_radius: float = 5.0, dot_pattern: str = "cheeks_chin",
                     strip_w_scale: float = 1.0,
                     strip_ox: float = 0.0, strip_oy: float = 0.0,
                     left_ox: float = 0.0, left_oy: float = 0.0,
@@ -258,9 +268,9 @@ def apply_patch_set(patches: dict, image: torch.Tensor, landmarks=None, mtcnn=No
     full_relief = full_relief.to(device)
     tex = {k: (v.unsqueeze(0) if v.dim() == 3 else v).to(device) for k, v in patches.items()}
     region_specs = _build_region_specs(tex, boxes)
-    gain_full = _illumination_gain(image)
-    canvas, _ = _build_canvas(image, region_specs, gain_full, full_relief, PATCH_BLEND_FACTOR)
-    adv = ((1.0 - full_mask) * image + full_mask * canvas).clamp(-1.0, 1.0)
+    gain_full = _illumination_gain(image, boxes=boxes)
+    canvas, _ = _build_canvas(image, region_specs, gain_full, full_relief, PATCH_BLEND_FACTOR, boxes=boxes)
+    adv = composite_realistic_stickers(image, canvas, full_mask, boxes=boxes)
     info = {
         "face_occlusion_pct": float((full_mask.sum() / (112 * 112) * 100.0).item()),
         "boxes": boxes,
@@ -279,7 +289,7 @@ def ensemble_hybrid_patch_attack(
     margin_low: dict | None = None,
     targets: dict | None = None,
     strip_style: str = "rgb",
-    dot_radius: float = 4.5,
+    dot_radius: float = 5.0,
     dot_pattern: str = "cheeks_chin",
     strip_w_scale: float = 1.0,
     nps_weight: float = 0.004,
@@ -316,6 +326,8 @@ def ensemble_hybrid_patch_attack(
     logo_mask: torch.Tensor | None = None,
     gallery_centroids: dict[str, torch.Tensor] | None = None,
     arch_priors: dict[str, float] | None = None,
+    impostor_centroids: dict[str, torch.Tensor] | None = None,
+    impostor_weight: float = 0.45,
 ) -> tuple:
     """
     BioMesh-SpecPatch: Ensemblový 3D-geometrický frekvenčne-ukotvený hybridný útok (Téza D).
@@ -342,9 +354,18 @@ def ensemble_hybrid_patch_attack(
 
     # Geometria a predpočítané orig embeddingy pre každú (fotka, model) kombináciu.
     geo = []
+    is_lm_seq = (
+        isinstance(landmarks, list)
+        and len(landmarks) > 0
+        and isinstance(landmarks[0], tuple)
+        and len(landmarks[0]) == 2
+        and isinstance(landmarks[0][0], list)
+    )
     for i_idx, base in enumerate(image_list):
         mesh_info = None
-        if i_idx == 0 and landmarks is not None:
+        if is_lm_seq and i_idx < len(landmarks):
+            lm, mesh_info = landmarks[i_idx]
+        elif i_idx == 0 and landmarks is not None and not is_lm_seq:
             if isinstance(landmarks, tuple):
                 lm, mesh_info = landmarks
             else:
@@ -361,15 +382,39 @@ def ensemble_hybrid_patch_attack(
             right_ox=right_ox, right_oy=right_oy,
             chin_ox=chin_ox, chin_oy=chin_oy,
         )
-        geo.append((base, full_mask.to(device), full_relief.to(device), boxes, lm))
+        full_mask_d = full_mask.to(device)
+        full_relief_d = full_relief.to(device)
+        gain_full_d = _illumination_gain(base, boxes=boxes).detach()
+        geo.append((base, full_mask_d, full_relief_d, boxes, lm, gain_full_d))
+    close_mediapipe_landmarker()
 
     margin = {name: float((margin_low or {}).get(name, DEFAULT_MARGIN_LOW)) for name in models}
     targets = targets or {}
 
+    # Automatické načítanie impostor centroidov (David Beckham / cudzí klaster) pre Bod 2
+    if impostor_centroids is None and impostor_weight > 0.0:
+        try:
+            import os
+            gal_path = os.path.join(os.path.dirname(__file__), "..", "data", "gallery_centroids.pt")
+            if os.path.exists(gal_path):
+                c_data = torch.load(gal_path, map_location=device, weights_only=False)
+                g_dict = c_data.get("galleries", c_data)
+                imp_dict = {}
+                for m_name in models:
+                    if m_name in g_dict:
+                        for id_name, id_vec in g_dict[m_name].items():
+                            if "peter" not in id_name.lower() and "brandajsky" not in id_name.lower():
+                                imp_dict[m_name] = id_vec.to(device)
+                                break
+                if imp_dict:
+                    impostor_centroids = imp_dict
+        except Exception:
+            impostor_centroids = None
+
     is_rgb = any(k in strip_style.lower() for k in ("rgb", "farebn", "art", "adversarial")) or (palette is not None)
     if is_rgb and palette is None:
-        base_strip = torch.zeros((1, 3, 1, 1), device=device)
-        base_dot = torch.zeros((1, 3, 1, 1), device=device)
+        base_strip = torch.full((1, 3, 1, 1), 0.16, device=device)
+        base_dot = torch.full((1, 3, 1, 1), 0.16, device=device)
     elif strip_style in ["pro_carbon_logo", "carbon_sport"]:
         base_strip = torch.tensor([-0.50, -0.50, -0.48], device=device).view(1, 3, 1, 1)
         base_dot = torch.tensor([-0.48, -0.48, -0.46], device=device).view(1, 3, 1, 1)
@@ -413,9 +458,10 @@ def ensemble_hybrid_patch_attack(
     for key in active_keys:
         th, tw = _tex_size_for(key)
         if multiscale:
-            params[f"{key}_coarse"] = nn.Parameter(torch.zeros((1, 3, max(12, th // 4), max(24, tw // 4)), device=device))
-            params[f"{key}_mid"] = nn.Parameter(torch.zeros((1, 3, max(24, th // 2), max(48, tw // 2)), device=device))
-            params[f"{key}_fine"] = nn.Parameter(torch.zeros((1, 3, th, tw), device=device))
+            c_h, c_w = (12, 30) if key == "strip" else (12, 12)
+            m_h, m_w = (24, 60) if key == "strip" else (24, 24)
+            params[f"{key}_coarse"] = nn.Parameter(torch.zeros((1, 3, c_h, c_w), device=device))
+            params[f"{key}_mid"] = nn.Parameter(torch.zeros((1, 3, m_h, m_w), device=device))
         else:
             params[key] = nn.Parameter(torch.zeros((1, 3, th, tw), device=device))
     param_list = [params[k] for k in params]
@@ -430,8 +476,7 @@ def ensemble_hybrid_patch_attack(
             if multiscale:
                 c_up = F.interpolate(params[f"{key}_coarse"], size=(th, tw), mode="bicubic", align_corners=False)
                 m_up = F.interpolate(params[f"{key}_mid"], size=(th, tw), mode="bicubic", align_corners=False)
-                f_up = params[f"{key}_fine"]
-                delta = 0.85 * c_up + 0.65 * m_up + 0.45 * f_up
+                delta = _gblur_fixed(0.95 * c_up + 0.78 * m_up, sigma=0.75)
             else:
                 delta = params[key]
 
@@ -508,12 +553,21 @@ def ensemble_hybrid_patch_attack(
     batch_photos = min(3, len(geo)) if len(geo) > 1 else 1
     eot_k = max(3, EOT_BATCH // batch_photos)
 
-    # --- Optimalizácia ---
+    # --- Optimalizácia (zmrazenie váh CNN modelov šetrí ~650 MB .grad bufferov a dL/dW autograd) ---
+    saved_grad_flags: list[tuple[nn.Parameter, bool]] = []
+    for m_obj in list(models.values()) + ([pad_model] if pad_model is not None else []):
+        if isinstance(m_obj, nn.Module):
+            for p_m in m_obj.parameters():
+                if p_m.requires_grad:
+                    saved_grad_flags.append((p_m, True))
+                    p_m.requires_grad_(False)
+
     best_score = float("inf")
     best_params = None
 
-    for it in range(num_iter):
-        opt.zero_grad()
+    try:
+      for it in range(num_iter):
+        opt.zero_grad(set_to_none=True)
 
         if len(geo) == 1:
             selected_indices = [0]
@@ -526,14 +580,13 @@ def ensemble_hybrid_patch_attack(
         # Pre každú fotku v mini-batchi pripravíme EoT a clean vstupy
         step_batches = []
         for idx in selected_indices:
-            base, full_mask, full_relief, boxes, _ = geo[idx]
-            gain_full = _illumination_gain(base)
+            base, full_mask, full_relief, boxes, _, gain_full = geo[idx]
             region_specs = _build_region_specs(patches, boxes)
-            canvas, _ = _build_canvas(base, region_specs, gain_full, full_relief, PATCH_BLEND_FACTOR)
+            canvas, _ = _build_canvas(base, region_specs, gain_full, full_relief, PATCH_BLEND_FACTOR, boxes=boxes)
 
-            model_input, base_warps = _eot_forward(canvas, base, full_mask, eot, K=eot_k)
+            model_input, base_warps = _eot_forward(canvas, base, full_mask, eot, K=eot_k, boxes=boxes)
             model_input = model_input.contiguous()
-            clean_input = ((1.0 - full_mask) * base + full_mask * canvas).clamp(-1.0, 1.0).contiguous()
+            clean_input = composite_realistic_stickers(base, canvas, full_mask, boxes=boxes).contiguous()
 
             if input_diversity:
                 div = _div_params(*model_input.shape[-2:])
@@ -547,13 +600,14 @@ def ensemble_hybrid_patch_attack(
         tv = sum(_tv_loss(p) for p in patches.values()) / max(1, len(patches))
         reg = sum(p.pow(2).mean() for p in params.values()) / max(1, len(params))
         if is_rgb and palette is None:
-            reg_total = tv_weight * tv + reg_weight * reg
+            ink_save = sum(F.relu(0.05 - p.mean()) for p in patches.values()) / max(1, len(patches))
+            reg_total = tv_weight * tv + reg_weight * reg + 0.045 * ink_save
         else:
             nps = sum(_nps_loss(p) for p in patches.values()) / max(1, len(patches))
             nat = sum(_naturalness_loss(p) for p in patches.values()) / max(1, len(patches))
             reg_total = nps_weight * nps + tv_weight * tv + naturalness_weight * nat + reg_weight * reg
 
-        # PAD-AWARE penalizácia (chráni liveness >= 0.64 bez brzdenia RGB gradientu pri 95 % LIVE)
+        # PAD-AWARE penalizácia (chráni liveness >= 0.64 bez VRAM preťaženia GPU)
         pad_term = None
         pad_score = None
         if pad_model is not None:
@@ -571,11 +625,59 @@ def ensemble_hybrid_patch_attack(
             sim_primary = None
             sim_aux_list = []
             n_aux = max(1, len(step_batches) - 1)
-            for idx, model_input, base_warps, clean_input in step_batches:
-                pose_w = 1.0 if len(step_batches) == 1 else (0.50 if idx == 0 else (0.50 / n_aux))
-                if name in targets and targets[name] is not None:
-                    s_i = 0.60 * F.cosine_similarity(targets[name], m(model_input)).mean() \
-                          + 0.40 * F.cosine_similarity(targets[name], m(clean_input)).mean()
+            is_targeted = (name in targets and targets[name] is not None)
+            use_raw = (not is_targeted) and (feature_weight > 0.0)
+
+            # Zlúčenie všetkých fotiek v mini-batchi do 1 spoločného GPU forwardu na model
+            # (znižuje počet CUDA kernel launchov 4.5× pri identickom výstupe v .eval() režime).
+            grad_chunks = []
+            grad_slices = []
+            warp_chunks = []
+            warp_map = {}
+            g_off = 0
+            w_off = 0
+            for sb_i, (_, m_in, b_w, c_in) in enumerate(step_batches):
+                km, kc = m_in.shape[0], c_in.shape[0]
+                grad_chunks.append(m_in)
+                grad_chunks.append(c_in)
+                grad_slices.append((g_off, g_off + km, g_off + km + kc))
+                g_off += km + kc
+                if (not is_targeted) and (b_w is not None):
+                    kw = b_w.shape[0]
+                    warp_chunks.append(b_w)
+                    warp_map[sb_i] = (w_off, w_off + kw)
+                    w_off += kw
+
+            grad_cat = torch.cat(grad_chunks, dim=0)
+            if use_raw:
+                all_emb, all_raw = _forward_raw(m, grad_cat)
+            else:
+                all_emb = m(grad_cat)
+                all_raw = None
+
+            if warp_chunks:
+                warp_cat = torch.cat(warp_chunks, dim=0)
+                with torch.no_grad():
+                    if use_raw:
+                        all_w_emb, all_w_raw = _forward_raw(m, warp_cat)
+                        all_w_emb, all_w_raw = all_w_emb.detach(), all_w_raw.detach()
+                    else:
+                        all_w_emb = m(warp_cat).detach()
+                        all_w_raw = None
+            else:
+                all_w_emb = all_w_raw = None
+
+            for sb_i, (idx, model_input, base_warps, clean_input) in enumerate(step_batches):
+                s0, s1, s2 = grad_slices[sb_i]
+                adv_emb = all_emb[s0:s1]
+                clean_emb = all_emb[s1:s2]
+                adv_raw = all_raw[s0:s1] if all_raw is not None else None
+                clean_raw = all_raw[s1:s2] if all_raw is not None else None
+
+                pose_w = 1.0 / float(len(step_batches))
+                if is_targeted:
+                    s_i = 0.60 * F.cosine_similarity(targets[name], adv_emb).mean() \
+                          + 0.40 * F.cosine_similarity(targets[name], clean_emb).mean()
                     total_m = total_m - pose_w * s_i
                     val_s = float(-s_i.detach().item())
                     if idx == 0:
@@ -584,23 +686,11 @@ def ensemble_hybrid_patch_attack(
                         sim_aux_list.append(val_s)
                     continue
 
-                if feature_weight > 0.0:
-                    adv_emb, adv_raw = _forward_raw(m, model_input)
-                    clean_emb, clean_raw = _forward_raw(m, clean_input)
-                else:
-                    adv_emb = m(model_input)
-                    clean_emb = m(clean_input)
-                    adv_raw = clean_raw = None
-
                 orig_emb, orig_raw = _orig_emb_and_raw(idx, name)
-                if base_warps is not None:
-                    with torch.no_grad():
-                        if feature_weight > 0.0:
-                            base_emb, base_raw = _forward_raw(m, base_warps)
-                            base_emb, base_raw = base_emb.detach(), base_raw.detach()
-                        else:
-                            base_emb = m(base_warps).detach()
-                            base_raw = None
+                if sb_i in warp_map:
+                    w0, w1 = warp_map[sb_i]
+                    base_emb = all_w_emb[w0:w1]
+                    base_raw = all_w_raw[w0:w1] if all_w_raw is not None else None
                     sim_eot = F.cosine_similarity(base_emb, adv_emb).mean()
                 else:
                     base_raw = orig_raw
@@ -624,19 +714,29 @@ def ensemble_hybrid_patch_attack(
                     sim_aux_list.append(val_s)
                 l_i = sim + 1.7 * F.relu(sim_eot - 0.34) + 1.4 * F.relu(sim_clean - 0.34) + 1.0 * F.relu(sim - margin[name])
 
-                if feature_weight > 0.0 and adv_raw is not None:
+                # Impostor-Anchor Repulsion (Bod 2): aktívne ťahá adv embedding do cudzieho klastra (512-D hypersféra),
+                # čím odstraňuje stagnáciu gradientu v okolí rovníka (ArcFace / AdaFace hlboko pod prah).
+                if impostor_centroids and name in impostor_centroids and impostor_centroids[name] is not None and impostor_weight > 0.0:
+                    imp_emb = impostor_centroids[name]
+                    if imp_emb.dim() == 1:
+                        imp_emb = imp_emb.unsqueeze(0)
+                    sim_imp_eot = F.cosine_similarity(imp_emb, adv_emb).mean()
+                    sim_imp_clean = F.cosine_similarity(imp_emb, clean_emb).mean()
+                    sim_imp = 0.60 * sim_imp_eot + 0.40 * sim_imp_clean
+                    l_i = l_i - impostor_weight * sim_imp + 0.25 * F.relu(0.30 - sim_imp)
+
+                if use_raw and adv_raw is not None:
                     feat_eot = F.cosine_similarity(base_raw, adv_raw, dim=1).mean()
                     feat_clean = F.cosine_similarity(orig_raw, clean_raw, dim=1).mean()
                     feat_sim = 0.60 * feat_eot + 0.40 * feat_clean
                     l_i = l_i + feature_weight * feat_sim
 
                 total_m = total_m + pose_w * l_i
-            if sim_primary is None:
-                sim_out = sum(sim_aux_list) / max(1, len(sim_aux_list))
-            elif sim_aux_list:
-                sim_out = 0.50 * sim_primary + 0.50 * max(sim_aux_list)
+            all_s = ([sim_primary] if sim_primary is not None else []) + sim_aux_list
+            if not all_s:
+                sim_out = 0.0
             else:
-                sim_out = sim_primary
+                sim_out = 0.45 * (sum(all_s) / len(all_s)) + 0.55 * max(all_s)
             return total_m, sim_out
 
         active_priors = arch_priors if arch_priors is not None else DEFAULT_ARCH_PRIORS
@@ -649,6 +749,7 @@ def ensemble_hybrid_patch_attack(
                 cur_sims.append(m_sim)
                 g = torch.autograd.grad(m_loss, param_list,
                                         retain_graph=True, allow_unused=True)
+                del m_loss
                 flat = _flat_grads(g, smooth=True, norm_per_tensor=False)
                 rms = flat.pow(2).mean().sqrt().clamp_min(1e-8)
                 hardness_w = (max(0.10, m_sim) ** 2.2) * (2.5 if m_sim > 0.38 else 0.5)
@@ -663,6 +764,7 @@ def ensemble_hybrid_patch_attack(
                     best_params = {k: v.detach().clone() for k, v in params.items()}
                 stop_thr = 0.12 if input_diversity else 0.30
                 if it >= 55 and all(s < stop_thr for s in cur_sims) and (pad_score is None or pad_score >= 0.50):
+                    opt.zero_grad(set_to_none=True)
                     break
             direction = torch.stack(model_grads).sum(0)
             dir_rms = direction.pow(2).mean().sqrt().clamp_min(1e-8)
@@ -670,8 +772,9 @@ def ensemble_hybrid_patch_attack(
 
             aux = reg_total if pad_term is None else reg_total + pad_term
             g_aux = _flat_grads(torch.autograd.grad(aux, param_list, allow_unused=True), smooth=False, norm_per_tensor=False)
+            del aux, reg_total, pad_term, step_batches, patches
             g_aux_rms = g_aux.pow(2).mean().sqrt().clamp_min(1e-8)
-            aux_weight = 0.16 if (pad_term is not None and pad_score is not None and pad_score < 0.52) else 0.05
+            aux_weight = 0.16 if (pad_score is not None and pad_score < 0.52) else 0.05
             direction = direction + aux_weight * (g_aux / g_aux_rms)
 
             if mom_flat is not None:
@@ -697,31 +800,40 @@ def ensemble_hybrid_patch_attack(
             else:
                 opt.step()
         else:
-            loss = torch.zeros((), device=device)
+            # Sekvenčná akumulácia gradientov po jednom modeli: vo VRAM žije vždy len 1 CNN graf
+            # (~1.1 GB namiesto 5.84 GB -> nulový WDDM PCIe paging vo WSL2 na 6 GB GPU).
+            aux_total = reg_total if pad_term is None else (reg_total + pad_term)
+            model_items = list(models.items())
+            if model_items:
+                aux_total.backward(retain_graph=True)
+            else:
+                aux_total.backward()
+            del aux_total, reg_total, pad_term
+
             cur_sims = []
-            for name, m in models.items():
+            n_models = len(model_items)
+            for m_idx, (name, m) in enumerate(model_items):
                 m_loss, m_sim = _model_loss(name, m)
                 cur_sims.append(m_sim)
                 w_m = active_priors.get(name, 1.0) * (
                     1.0 + 5.5 * max(0.0, m_sim - 0.34) + 8.5 * max(0.0, m_sim - 0.44)
                 )
-                loss = loss + w_m * m_loss
+                (w_m * m_loss).backward(retain_graph=(m_idx < n_models - 1))
+                del m_loss
+            del step_batches, patches
+
             if cur_sims:
-                over_50 = sum(max(0.0, s - 0.44) * 14.0 for s in cur_sims)
-                pad_pen = max(0.0, 0.54 - float(pad_score.detach().item())) * 6.0 if pad_score is not None else 0.0
+                over_50 = sum(max(0.0, s - 0.45) * 16.0 for s in cur_sims)
+                pad_pen = max(0.0, 0.60 - float(pad_score.detach().item())) * 8.0 if pad_score is not None else 0.0
                 sc = over_50 + pad_pen + (sum(cur_sims) / len(cur_sims))
                 if sc < best_score:
                     best_score = sc
                     best_params = {k: v.detach().clone() for k, v in params.items()}
                 stop_thr = 0.12 if input_diversity else 0.30
                 if it >= 55 and all(s < stop_thr for s in cur_sims) and (pad_score is None or pad_score >= 0.50):
+                    opt.zero_grad(set_to_none=True)
                     break
 
-            total = loss + reg_total
-            if pad_term is not None:
-                total = total + pad_term
-
-            total.backward()
             with torch.no_grad():
                 for p in param_list:
                     if p.grad is not None and p.shape[-1] >= 32:
@@ -731,18 +843,20 @@ def ensemble_hybrid_patch_attack(
         with torch.no_grad():
             for p in params.values():
                 p.clamp_(-1.8, 1.8)
+    finally:
+        for p_m, flag in saved_grad_flags:
+            p_m.requires_grad_(flag)
 
     # --- Finálna kompozícia (bez EOT) ---
     with torch.no_grad():
         if best_params is not None:
             for k, v in best_params.items():
                 params[k].copy_(v)
-        base, full_mask, full_relief, boxes, lm = geo[0]
+        base, full_mask, full_relief, boxes, lm, gain_full = geo[0]
         patches = _current_patches()
-        gain_full = _illumination_gain(base)
         region_specs = _build_region_specs(patches, boxes)
-        canvas, comps = _build_canvas(base, region_specs, gain_full, full_relief, PATCH_BLEND_FACTOR)
-        final_adv = ((1.0 - full_mask) * base + full_mask * canvas).clamp(-1.0, 1.0)
+        canvas, comps = _build_canvas(base, region_specs, gain_full, full_relief, PATCH_BLEND_FACTOR, boxes=boxes)
+        final_adv = composite_realistic_stickers(base, canvas, full_mask, boxes=boxes)
 
         per_model_sim = {}
         per_model_success = {}

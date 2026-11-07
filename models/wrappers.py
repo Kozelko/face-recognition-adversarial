@@ -57,6 +57,7 @@ class BenchmarkCNNWrapper(FaceModelWrapper):
         
         self.model.to(device)
         self.model.eval()
+        self.model.requires_grad_(False)
         self.classes = checkpoint.get("classes", None) if (checkpoint and isinstance(checkpoint, dict)) else None
 
     def forward(self, x, return_raw: bool = False):
@@ -110,6 +111,7 @@ class FaceNetWrapper(FaceModelWrapper):
         # alebo normalizovaný podobne ako u nás: mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]
         self.model = InceptionResnetV1(pretrained=pretrained).to(device)
         self.model.eval()
+        self.model.requires_grad_(False)
 
     def forward(self, x, return_raw: bool = False):
         x = x.to(next(self.model.parameters()).device)
@@ -165,6 +167,7 @@ class ArcFaceWrapper(FaceModelWrapper):
             
         self.model = self.model.to(device)
         self.model.eval()
+        self.model.requires_grad_(False)
 
     def forward(self, x, return_raw: bool = False):
         x = x.to(next(self.model.parameters()).device)
@@ -217,6 +220,7 @@ class AdaFaceWrapper(FaceModelWrapper):
                 
             self.model = self.model.to(device)
             self.model.eval()
+            self.model.requires_grad_(False)
         except ImportError:
             print("⚠️ Upozornenie: Modul models.adaface_net nenájdený.")
 

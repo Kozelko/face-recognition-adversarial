@@ -59,13 +59,12 @@ class MiniFASNetPAD(nn.Module):
             raise TypeError("MiniFASNetPAD: vstup musí byť torch.Tensor alebo numpy RGB.")
         if x.dim() == 3:
             x = x.unsqueeze(0)
-        x = x.float()
-        # Repo konvencia vstupu je [-1,1]; Minivision očakáva [0,255].
-        if float(x.min()) < -0.01:
-            x = (x + 1.0) * 127.5
-        elif float(x.max()) <= 1.5:
-            x = x * 255.0
-        return x.to(self.device)
+        x = x.float().to(self.device)
+        # Repo konvencia vstupu je [-1,1]; Minivision očakáva [0,255] (bez CPU-GPU syncu).
+        x_min = x.detach().amin()
+        x_max = x.detach().amax()
+        x = torch.where(x_min < -0.01, (x + 1.0) * 127.5, torch.where(x_max <= 1.5, x * 255.0, x))
+        return x
 
     def forward(self, x) -> torch.Tensor:
         """Live-prob triedy 1. BEZ @torch.no_grad() — diferencovateľné voči
